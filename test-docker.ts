@@ -1,8 +1,14 @@
 import Docker from 'dockerode';
 
-const docker = new Docker({ socketPath: '/var/run/docker.sock' });
+// Detect Windows and use appropriate connection
+const isWindows = process.platform === 'win32';
+const docker = isWindows 
+  ? new Docker({ host: 'localhost', port: 2375 })
+  : new Docker({ socketPath: '/var/run/docker.sock' });
 
-console.log('Testing Docker connection...\n');
+console.log('Testing Docker connection...');
+console.log(`Platform: ${process.platform}`);
+console.log(`Connection: ${isWindows ? 'TCP (localhost:2375)' : 'Unix socket'}\n`);
 
 async function testDockerConnection() {
   try {
