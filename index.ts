@@ -1,291 +1,267 @@
-import { generateText } from 'ai';
-import { openai } from '@ai-sdk/openai';
-import { drizzle } from 'drizzle-orm/bun-sqlite';
-import { Database } from 'bun:sqlite';
-import { sqliteTable, text, integer } from 'drizzle-orm/sqlite-core';
-import { eq, desc, inArray, and } from 'drizzle-orm';
-import Docker from 'dockerode';
-import { z } from 'zod';
+import { generateText, tool, type CoreMessage } from "ai";
+import { openai } from "@ai-sdk/openai";
+import { drizzle } from "drizzle-orm/bun-sqlite";
+import { Database } from "bun:sqlite";
+import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
+import { eq, desc, inArray, and, asc } from "drizzle-orm";
+import Docker from "dockerode";
+import { z } from "zod";
+
 // ============================================================================
-// DATABASE SCHEMA
+// 1. CONFIGURATION
 // ============================================================================
 
-const sessions = sqliteTable('sessions', {
-  id: text('id').primaryKey(),
-  createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
-  containerId: text('container_id'),
+// Adjust these based on your model's limits
+const CONTEXT_LIMIT = 5000; // Lower this from 20000
+const COMPACTION_THRESHOLD = 0.8; // Trigger at 80% of limit
+const KEEP_RECENT_MESSAGES = 6; // Keep last 6 messages uncompacted to maintain flow
+
+// ============================================================================
+// 2. DATABASE SCHEMA
+// ============================================================================
+
+const sessions = sqliteTable("sessions", {
+  id: text("id").primaryKey(),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+  containerId: text("container_id"),
 });
 
-const messages = sqliteTable('messages', {
-  id: text('id').primaryKey(),
-  sessionId: text('session_id').notNull().references(() => sessions.id),
-  role: text('role').notNull(), // 'user' | 'assistant' | 'system'
-  content: text('content').notNull(),
-  tokenCount: integer('token_count').notNull(),
-  createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
-  compacted: integer('compacted', { mode: 'boolean' }).notNull().default(false),
+const messages = sqliteTable("messages", {
+  id: text("id").primaryKey(),
+  sessionId: text("session_id")
+    .notNull()
+    .references(() => sessions.id),
+  role: text("role").notNull(), // 'system' | 'user' | 'assistant' | 'tool'
+  // We store content as a JSON string to handle complex ToolCall arrays from Vercel AI SDK
+  content: text("content").notNull(),
+  tokenCount: integer("token_count").notNull(),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+  compacted: integer("compacted", { mode: "boolean" }).notNull().default(false),
 });
 
-const compactionEvents = sqliteTable('compaction_events', {
-  id: text('id').primaryKey(),
-  sessionId: text('session_id').notNull().references(() => sessions.id),
-  summary: text('summary').notNull(),
-  compactedMessageIds: text('compacted_message_ids').notNull(), // JSON array
-  createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
+const compactionEvents = sqliteTable("compaction_events", {
+  id: text("id").primaryKey(),
+  sessionId: text("session_id")
+    .notNull()
+    .references(() => sessions.id),
+  summary: text("summary").notNull(),
+  compactedMessageIds: text("compacted_message_ids").notNull(), // JSON array of IDs
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
 });
 
 // ============================================================================
-// DATABASE SETUP
+// 3. DATABASE INITIALIZATION
 // ============================================================================
 
-const sqlite = new Database('agent.db');
+const sqlite = new Database("agent.db");
 const db = drizzle(sqlite);
 
-// Create tables if they don't exist
-sqlite.exec(`
-  CREATE TABLE IF NOT EXISTS sessions (
-    id TEXT PRIMARY KEY,
-    created_at INTEGER NOT NULL,
-    container_id TEXT
-  );
-`);
+function initDB() {
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      id TEXT PRIMARY KEY,
+      created_at INTEGER NOT NULL,
+      container_id TEXT
+    );
+  `);
 
-sqlite.exec(`
-  CREATE TABLE IF NOT EXISTS messages (
-    id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL,
-    role TEXT NOT NULL,
-    content TEXT NOT NULL,
-    token_count INTEGER NOT NULL,
-    created_at INTEGER NOT NULL,
-    compacted INTEGER NOT NULL DEFAULT 0,
-    FOREIGN KEY (session_id) REFERENCES sessions(id)
-  );
-`);
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS messages (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      content TEXT NOT NULL,
+      token_count INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      compacted INTEGER NOT NULL DEFAULT 0,
+      FOREIGN KEY (session_id) REFERENCES sessions(id)
+    );
+  `);
 
-sqlite.exec(`
-  CREATE TABLE IF NOT EXISTS compaction_events (
-    id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL,
-    summary TEXT NOT NULL,
-    compacted_message_ids TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    FOREIGN KEY (session_id) REFERENCES sessions(id)
-  );
-`);
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS compaction_events (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      compacted_message_ids TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (session_id) REFERENCES sessions(id)
+    );
+  `);
+  console.log("✅ Database schema initialized");
+}
 
-console.log('✅ Database schema initialized');
+initDB();
 
 // ============================================================================
-// DOCKER FUNCTIONS
+// 4. DOCKER INFRASTRUCTURE
 // ============================================================================
 
-console.log('Initializing Docker connection...');
-console.log('Platform:', process.platform);
-
-// Try multiple Docker connection methods
 let docker: Docker;
-const isWindows = process.platform === 'win32';
+const isWindows = process.platform === "win32";
 
 async function initializeDocker(): Promise<Docker> {
   const connectionAttempts: { name: string; config: Docker.DockerOptions }[] = [
-    { name: 'localhost:2375', config: { host: 'localhost', port: 2375 } },
-    { name: 'host.docker.internal:2375', config: { host: 'host.docker.internal', port: 2375 } },
-    { name: '127.0.0.1:2375', config: { host: '127.0.0.1', port: 2375 } },
+    { name: "localhost:2375", config: { host: "localhost", port: 2375 } },
+    {
+      name: "host.docker.internal",
+      config: { host: "host.docker.internal", port: 2375 },
+    },
+    { name: "Unix socket", config: { socketPath: "/var/run/docker.sock" } },
   ];
 
-  if (!isWindows) {
-    connectionAttempts.unshift({ 
-      name: 'Unix socket', 
-      config: { socketPath: '/var/run/docker.sock' } 
-    });
-  }
-
   for (const attempt of connectionAttempts) {
+    if (isWindows && attempt.name === "Unix socket") continue;
     try {
-      console.log(`Trying Docker connection: ${attempt.name}...`);
-      const dockerClient = new Docker(attempt.config);
-      await dockerClient.ping();
+      console.log(`Checking Docker at ${attempt.name}...`);
+      const client = new Docker(attempt.config);
+      await client.ping();
       console.log(`✅ Docker connected via ${attempt.name}`);
-      return dockerClient;
-    } catch (error: any) {
-      console.log(`❌ Failed to connect via ${attempt.name}: ${error.message || error.code}`);
+      return client;
+    } catch (e) {
+      // Ignore and try next
     }
   }
 
-  // If all attempts failed, show helpful error
-  console.error('\n❌ DOCKER CONNECTION FAILED - All attempts exhausted\n');
-  console.error('Please check:');
-  console.error('1. Docker Desktop is RUNNING');
-  console.error('2. Docker Desktop → Settings → General');
-  console.error('3. Enable: "Expose daemon on tcp://localhost:2375 without TLS"');
-  console.error('4. Click "Apply & Restart"');
-  console.error('5. Wait for Docker to fully restart\n');
-  console.error('Verify with: curl http://localhost:2375/_ping');
-  console.error('Should return: OK\n');
-  
+  console.error(
+    "❌ Docker connection failed. Ensure Docker Desktop is running.",
+  );
   process.exit(1);
 }
 
+// We initialize this at the top level for simplicity in this script
 docker = await initializeDocker();
 
 async function createContainer(): Promise<string> {
-  const container = await docker.createContainer({
-    Image: 'node:20-alpine',
-    Cmd: ['/bin/sh', '-c', 'tail -f /dev/null'],
-    WorkingDir: '/workspace',
-    HostConfig: {
-      AutoRemove: false,
-    },
-  });
-  
-  await container.start();
-  return container.id;
+  console.log("Creating container (Image: oven/bun:1-alpine)...");
+  // We use the oven/bun image so the agent has 'bun' available immediately
+  // We rely on 'docker pull oven/bun:1-alpine' happening if not present
+  try {
+    const container = await docker.createContainer({
+      Image: "oven/bun:1-alpine",
+      Cmd: ["/bin/sh", "-c", "tail -f /dev/null"], // Keep alive
+      WorkingDir: "/workspace",
+      HostConfig: {
+        AutoRemove: true, // Automatically clean up when stopped
+      },
+    });
+
+    await container.start();
+    return container.id;
+  } catch (error: any) {
+    if (error.statusCode === 404) {
+      console.log("Pulling image oven/bun:1-alpine...");
+      await new Promise((resolve, reject) => {
+        docker.pull("oven/bun:1-alpine", (err: any, stream: any) => {
+          if (err) return reject(err);
+          docker.modem.followProgress(stream, onFinished, onProgress);
+          function onFinished(err: any) {
+            if (err) reject(err);
+            else resolve(true);
+          }
+          function onProgress(event: any) {
+            /* silent */
+          }
+        });
+      });
+      return createContainer(); // Retry
+    }
+    throw error;
+  }
 }
 
-async function executeCommand(containerId: string, command: string): Promise<string> {
+async function executeCommand(
+  containerId: string,
+  command: string,
+): Promise<string> {
   const container = docker.getContainer(containerId);
-  
+
   const exec = await container.exec({
-    Cmd: ['/bin/sh', '-c', command],
+    Cmd: ["/bin/sh", "-c", command],
     AttachStdout: true,
     AttachStderr: true,
-    WorkingDir: '/workspace',
+    WorkingDir: "/workspace",
   });
-  
+
   const stream = await exec.start({ Detach: false, Tty: false });
-  
+
   return new Promise((resolve, reject) => {
-    let output = '';
-    
-    stream.on('data', (chunk: Buffer) => {
-      // Remove Docker stream header (8 bytes)
-      const data = chunk.length > 8 ? chunk.slice(8).toString() : chunk.toString();
-      output += data;
+    let output = "";
+    stream.on("data", (chunk: Buffer) => {
+      // Docker streams usually have an 8-byte header we should strip if multiplexed
+      // However, dockerode sometimes handles this depending on options.
+      // For safety with raw streams:
+      const raw = chunk.toString();
+      output += raw;
     });
-    
-    stream.on('end', () => {
-      resolve(output.trim());
+
+    stream.on("end", () => {
+      // Remove non-printable header characters if present (Docker header is usually 8 bytes)
+      // A simple clean is often enough for text output
+      // Note: This is a simplified stream reader.
+      resolve(output.replace(/[\x00-\x09\x0B-\x1F\x7F].{0,7}/g, "").trim());
     });
-    
-    stream.on('error', (err: Error) => {
-      reject(err);
-    });
+
+    stream.on("error", (err) => reject(err));
   });
+}
+
+async function writeFile(
+  containerId: string,
+  path: string,
+  content: string,
+): Promise<void> {
+  const container = docker.getContainer(containerId);
+
+  // 1. Ensure directory exists
+  const dir = path.substring(0, path.lastIndexOf("/"));
+  if (dir) {
+    const mkdirExec = await container.exec({ Cmd: ["mkdir", "-p", dir] });
+    await mkdirExec.start({ Detach: false });
+  }
+
+  // 2. Write file using base64 to avoid shell escaping hell
+  const b64Content = Buffer.from(content).toString("base64");
+  const exec = await container.exec({
+    Cmd: ["/bin/sh", "-c", `echo "${b64Content}" | base64 -d > ${path}`],
+  });
+  await exec.start({ Detach: false });
 }
 
 async function readFile(containerId: string, path: string): Promise<string> {
-  const container = docker.getContainer(containerId);
-  
-  const exec = await container.exec({
-    Cmd: ['/bin/sh', '-c', `cat ${path}`],
-    AttachStdout: true,
-    AttachStderr: true,
-  });
-  
-  const stream = await exec.start({ Detach: false, Tty: false });
-  
-  return new Promise((resolve, reject) => {
-    let output = '';
-    
-    stream.on('data', (chunk: Buffer) => {
-      const data = chunk.length > 8 ? chunk.slice(8).toString() : chunk.toString();
-      output += data;
-    });
-    
-    stream.on('end', () => {
-      resolve(output.trim());
-    });
-    
-    stream.on('error', (err: Error) => {
-      reject(err);
-    });
-  });
+  return await executeCommand(containerId, `cat ${path}`);
 }
 
-async function writeFile(containerId: string, path: string, content: string): Promise<void> {
-  const container = docker.getContainer(containerId);
-  
-  // Create directory first
-  const dir = path.substring(0, path.lastIndexOf('/'));
-  if (dir) {
-    const mkdirExec = await container.exec({
-      Cmd: ['/bin/sh', '-c', `mkdir -p ${dir}`],
-      AttachStdout: true,
-      AttachStderr: true,
-    });
-    await mkdirExec.start({ Detach: false, Tty: false });
-  }
-  
-  // Write file using cat with heredoc
-  const exec = await container.exec({
-    Cmd: ['/bin/sh', '-c', `cat > ${path} << 'EOFMARKER'\n${content}\nEOFMARKER`],
-    AttachStdout: true,
-    AttachStderr: true,
-  });
-  
-  await exec.start({ Detach: false, Tty: false });
-}
-
-async function listDirectory(containerId: string, path: string): Promise<string> {
-  const container = docker.getContainer(containerId);
-  
-  const exec = await container.exec({
-    Cmd: ['/bin/sh', '-c', `ls -la ${path}`],
-    AttachStdout: true,
-    AttachStderr: true,
-  });
-  
-  const stream = await exec.start({ Detach: false, Tty: false });
-  
-  return new Promise((resolve, reject) => {
-    let output = '';
-    
-    stream.on('data', (chunk: Buffer) => {
-      const data = chunk.length > 8 ? chunk.slice(8).toString() : chunk.toString();
-      output += data;
-    });
-    
-    stream.on('end', () => {
-      resolve(output.trim());
-    });
-    
-    stream.on('error', (err: Error) => {
-      reject(err);
-    });
-  });
+async function listDirectory(
+  containerId: string,
+  path: string,
+): Promise<string> {
+  return await executeCommand(containerId, `ls -la ${path}`);
 }
 
 async function cleanupContainer(containerId: string): Promise<void> {
-  const container = docker.getContainer(containerId);
-  await container.stop();
-  await container.remove();
+  try {
+    const container = docker.getContainer(containerId);
+    await container.stop();
+    // AutoRemove is set in creation, so it disappears
+  } catch (e) {
+    console.error("Error cleaning up container:", e);
+  }
 }
 
 // ============================================================================
-// TOKEN COUNTING
+// 5. HELPER FUNCTIONS: TOKENS & STORAGE
 // ============================================================================
 
-function estimateTokens(text: string): number {
-  // Simple heuristic: approximately 4 characters per token
-  return Math.ceil(text.length / 4);
+// Simple heuristic for token counting
+function estimateTokens(content: any): number {
+  const str = typeof content === "string" ? content : JSON.stringify(content);
+  return Math.ceil(str.length / 2); // Roughly 2 chars per token
 }
 
 // ============================================================================
-// CONTEXT COMPACTION
+// 6. CONTEXT COMPACTION LOGIC
 // ============================================================================
-
-const CONTEXT_LIMIT = 5000; // tokens (lowered for testing - change to 128000 for production)
-const COMPACTION_THRESHOLD = 0.8; // 80% (triggers at 4000 tokens)
-const KEEP_RECENT_MESSAGES = 5; // Keep fewer messages to trigger compaction faster
-
-function calculateTotalTokens(messages: any[]): number {
-  return messages.reduce((sum, msg) => sum + (msg.tokenCount || 0), 0);
-}
-
-function shouldCompact(totalTokens: number): boolean {
-  return totalTokens > (CONTEXT_LIMIT * COMPACTION_THRESHOLD);
-}
 
 async function getPreviousSummary(sessionId: string): Promise<string | null> {
   const events = await db
@@ -294,376 +270,393 @@ async function getPreviousSummary(sessionId: string): Promise<string | null> {
     .where(eq(compactionEvents.sessionId, sessionId))
     .orderBy(desc(compactionEvents.createdAt))
     .limit(1);
-  
+
   return events.length > 0 ? events[0].summary : null;
 }
 
-// ============================================================================
-// AGENT LOOP
-// ============================================================================
+async function performCompaction(sessionId: string, activeMessages: any[]) {
+  // We keep:
+  // 1. The System Message (usually index 0)
+  // 2. The last N messages (KEEP_RECENT_MESSAGES)
+  // We compact: Everything in between.
 
-async function runAgent(sessionId: string, containerId: string, userQuery: string) {
-  // Save user message
-  const userMessageId = `msg_${Date.now()}`;
-  await db.insert(messages).values({
-    id: userMessageId,
-    sessionId,
-    role: 'user',
-    content: userQuery,
-    tokenCount: estimateTokens(userQuery),
-    createdAt: new Date(),
-    compacted: false,
-  });
-  
-  let currentStep = 0;
-  let continueLoop = true;
-  let finalResponse = '';
-  
-  while (continueLoop && currentStep < 20) {
-    // Get all messages from DB
-    const allMessages = await db
-      .select()
-      .from(messages)
-      .where(eq(messages.sessionId, sessionId))
-      .orderBy(messages.createdAt);
-    
-    // Calculate total tokens
-    const totalTokens = calculateTotalTokens(allMessages);
-    console.log(`\nStep ${currentStep + 1}: Token count: ${totalTokens}/${CONTEXT_LIMIT}`);
-    
-    // Check if compaction needed
-    if (totalTokens > (CONTEXT_LIMIT * COMPACTION_THRESHOLD)) {
-      console.log(`🔄 COMPACTING CONTEXT (${totalTokens} tokens exceeds threshold)`);
-      
-      // Get non-compacted messages
-      const nonCompactedMessages = allMessages.filter(m => !m.compacted);
-      
-      // Keep system message and last N messages
-      const systemMessages = nonCompactedMessages.filter(m => m.role === 'system');
-      const otherMessages = nonCompactedMessages.filter(m => m.role !== 'system');
-      const recentMessages = otherMessages.slice(-KEEP_RECENT_MESSAGES);
-      const messagesToCompact = otherMessages.slice(0, -KEEP_RECENT_MESSAGES);
-      
-      if (messagesToCompact.length > 0) {
-        // Get previous summary
-        const previousSummary = await getPreviousSummary(sessionId);
-        
-        // Generate summary
-        const messagesText = messagesToCompact
-          .map(msg => `[${msg.role}]: ${msg.content}`)
-          .join('\n\n');
-        
-        const summaryPrompt = `Summarize the following conversation history between a user and a coding agent.
-Focus on:
-1. The main task/goal
-2. Key files created and their purposes
-3. Important decisions or approaches taken
-4. Current progress and state
-5. Any blockers or errors
+  const systemMessages = activeMessages.filter((m) => m.role === "system");
+  const otherMessages = activeMessages.filter((m) => m.role !== "system");
 
-${previousSummary ? `Previous summary:\n${previousSummary}\n\n` : ''}
-
-Messages to summarize:
-${messagesText}
-
-Provide a concise summary that allows the agent to continue working effectively.`;
-
-        const summaryResult = await generateText({
-          model: openai('gpt-4-turbo'),
-          prompt: summaryPrompt,
-          maxTokens: 1000,
-        });
-        
-        const summary = summaryResult.text;
-        
-        // Save compaction event
-        const compactionId = `compaction_${Date.now()}`;
-        await db.insert(compactionEvents).values({
-          id: compactionId,
-          sessionId,
-          summary,
-          compactedMessageIds: JSON.stringify(messagesToCompact.map(m => m.id)),
-          createdAt: new Date(),
-        });
-        
-        // Mark old messages as compacted
-        const idsToCompact: string[] = messagesToCompact.map(m => m.id);
-        await db
-          .update(messages)
-          .set({ compacted: true })
-          .where(inArray(messages.id, idsToCompact));
-        
-        // Create summary message
-        const summaryMessageId = `msg_summary_${Date.now()}`;
-        await db.insert(messages).values({
-          id: summaryMessageId,
-          sessionId,
-          role: 'assistant',
-          content: `[CONTEXT SUMMARY]: ${summary}`,
-          tokenCount: estimateTokens(summary),
-          createdAt: new Date(),
-          compacted: false,
-        });
-        
-        console.log(`✅ Compacted ${messagesToCompact.length} messages into summary`);
-      }
-    }
-    
-    // Rebuild message history from non-compacted messages
-    const activeMessages = await db
-      .select()
-      .from(messages)
-      .where(and(eq(messages.sessionId, sessionId), eq(messages.compacted, false)))
-      .orderBy(messages.createdAt);
-    
-    const messageHistory = activeMessages.map((msg: any) => ({
-      role: msg.role as 'user' | 'assistant' | 'system',
-      content: msg.content,
-    }));
-    
-    console.log(`Starting agent with ${messageHistory.length} messages in context...`);
-    
-    // Run one step
-    const result = await generateText({
-      model: openai('gpt-4-turbo'),
-      messages: messageHistory,
-      tools: {
-        execute_command: {
-          description: 'Execute a shell command inside the Docker container',
-          parameters: z.object({
-            command: z.string().describe('The shell command to execute'),
-          }),
-          execute: async ({ command }) => {
-            console.log(`[TOOL] Executing command: ${command}`);
-            try {
-              const output = await executeCommand(containerId, command);
-              console.log(`[TOOL] Command output: ${output.substring(0, 200)}...`);
-              return output;
-            } catch (error: any) {
-              console.log(`[TOOL] Command error: ${error.message}`);
-              return `Error: ${error.message}`;
-            }
-          },
-        },
-        read_file: {
-          description: 'Read the contents of a file from the Docker container',
-          parameters: z.object({
-            path: z.string().describe('The path to the file to read'),
-          }),
-          execute: async ({ path }) => {
-            console.log(`[TOOL] Reading file: ${path}`);
-            try {
-              const content = await readFile(containerId, path);
-              console.log(`[TOOL] File read successfully, length: ${content.length}`);
-              return content;
-            } catch (error: any) {
-              console.log(`[TOOL] Read error: ${error.message}`);
-              return `Error: ${error.message}`;
-            }
-          },
-        },
-        write_file: {
-          description: 'Write content to a file in the Docker container',
-          parameters: z.object({
-            path: z.string().describe('The path where the file should be written'),
-            content: z.string().describe('The content to write to the file'),
-          }),
-          execute: async ({ path, content }) => {
-            console.log(`[TOOL] Writing file: ${path} (${content.length} chars)`);
-            try {
-              await writeFile(containerId, path, content);
-              console.log(`[TOOL] File written successfully`);
-              return `File written successfully to ${path}`;
-            } catch (error: any) {
-              console.log(`[TOOL] Write error: ${error.message}`);
-              return `Error: ${error.message}`;
-            }
-          },
-        },
-        list_directory: {
-          description: 'List the contents of a directory in the Docker container',
-          parameters: z.object({
-            path: z.string().describe('The path to the directory to list'),
-          }),
-          execute: async ({ path }) => {
-            console.log(`[TOOL] Listing directory: ${path}`);
-            try {
-              const listing = await listDirectory(containerId, path);
-              console.log(`[TOOL] Directory listed successfully`);
-              return listing;
-            } catch (error: any) {
-              console.log(`[TOOL] List error: ${error.message}`);
-              return `Error: ${error.message}`;
-            }
-          },
-        },
-      },
-      maxSteps: 1, // Only do one step at a time so we can check compaction
-    });
-
-    // Save assistant response and tool results
-    // Process each step - steps contain tool calls and results
-    for (const step of result.steps) {
-      // Save tool calls and results as assistant messages
-      if (step.toolCalls && step.toolCalls.length > 0) {
-        const msgId = `msg_step_${Date.now()}_${Math.random()}`;
-        
-        // Format tool calls and results for storage
-        let content = '';
-        for (let i = 0; i < step.toolCalls.length; i++) {
-          const toolCall = step.toolCalls[i];
-          const toolResult = step.toolResults ? step.toolResults[i] : null;
-          
-          content += `[TOOL CALL: ${toolCall.toolName}]\n`;
-          content += `Args: ${JSON.stringify(toolCall.args)}\n`;
-          if (toolResult) {
-            const resultStr = typeof toolResult.result === 'string' 
-              ? toolResult.result.substring(0, 500) 
-              : JSON.stringify(toolResult.result).substring(0, 500);
-            content += `Result: ${resultStr}\n\n`;
-          }
-        }
-        
-        await db.insert(messages).values({
-          id: msgId,
-          sessionId,
-          role: 'assistant',
-          content: content.trim(),
-          tokenCount: estimateTokens(content),
-          createdAt: new Date(),
-          compacted: false,
-        });
-      }
-      
-      // Save text response if present
-      if (step.text) {
-        const msgId = `msg_text_${Date.now()}_${Math.random()}`;
-        await db.insert(messages).values({
-          id: msgId,
-          sessionId,
-          role: 'assistant',
-          content: step.text,
-          tokenCount: estimateTokens(step.text),
-          createdAt: new Date(),
-          compacted: false,
-        });
-        finalResponse = step.text;
-      }
-    }
-    
-    // Also save final text if present
-    if (result.text && !result.steps.some(s => s.text === result.text)) {
-      const msgId = `msg_final_${Date.now()}_${Math.random()}`;
-      await db.insert(messages).values({
-        id: msgId,
-        sessionId,
-        role: 'assistant',
-        content: result.text,
-        tokenCount: estimateTokens(result.text),
-        createdAt: new Date(),
-        compacted: false,
-      });
-      finalResponse = result.text;
-    }
-    
-    // Check if we should continue
-    const lastStep = result.steps[result.steps.length - 1];
-    if (lastStep && lastStep.finishReason === 'stop') {
-      continueLoop = false;
-    }
-    
-    currentStep++;
+  if (otherMessages.length <= KEEP_RECENT_MESSAGES) {
+    console.log("⚠️ Limit reached but not enough messages to compact safely.");
+    return;
   }
 
-  console.log('\n=== Agent completed ===');
-  
-  return finalResponse;
+  const messagesToCompact = otherMessages.slice(
+    0,
+    otherMessages.length - KEEP_RECENT_MESSAGES,
+  );
+  const idsToCompact = messagesToCompact.map((m) => m.id);
+
+  console.log(`🔄 Compacting ${messagesToCompact.length} messages...`);
+
+  // Prepare transcript for summarizer
+  const transcript = messagesToCompact
+    .map((m) => {
+      let contentStr = "";
+      try {
+        const parsed = JSON.parse(m.content);
+        if (typeof parsed === "string") contentStr = parsed;
+        else if (Array.isArray(parsed)) {
+          // Handle array content (tool calls etc)
+          contentStr = parsed
+            .map((p) => {
+              if (p.type === "text") return p.text;
+              if (p.type === "tool-call") return `[Tool Call: ${p.toolName}]`;
+              if (p.type === "tool-result")
+                return `[Tool Result: ${p.toolName}]`;
+              return JSON.stringify(p);
+            })
+            .join(" ");
+        }
+      } catch (e) {
+        contentStr = m.content;
+      }
+      return `${m.role.toUpperCase()}: ${contentStr}`;
+    })
+    .join("\n\n");
+
+  const prevSummary = await getPreviousSummary(sessionId);
+
+  const summaryPrompt = `
+    You are a technical project manager supervising a coding agent.
+    Summarize the following conversation history concisely.
+    
+    PREVIOUS SUMMARY:
+    ${prevSummary || "None"}
+    
+    RECENT CONVERSATION TO MERGE:
+    ${transcript}
+    
+    INSTRUCTIONS:
+    1. Update the summary to reflect the current state of the project.
+    2. List created files and their purposes.
+    3. Note any outstanding errors or TODOs.
+    4. Discard chatty conversation, focus on technical facts.
+  `;
+
+  const { text: newSummary } = await generateText({
+    model: openai("gpt-4-turbo"),
+    prompt: summaryPrompt,
+  });
+
+  // Save event
+  await db.insert(compactionEvents).values({
+    id: `evt_${Date.now()}`,
+    sessionId,
+    summary: newSummary,
+    compactedMessageIds: JSON.stringify(idsToCompact),
+    createdAt: new Date(),
+  });
+
+  // Mark messages as compacted
+  await db
+    .update(messages)
+    .set({ compacted: true })
+    .where(inArray(messages.id, idsToCompact));
+
+  console.log(
+    `✅ Compaction complete. New summary length: ${newSummary.length} chars.`,
+  );
 }
 
 // ============================================================================
-// MAIN FUNCTION
+// 7. AGENT LOOP & TOOLS
+// ============================================================================
+
+const createTools = (containerId: string) => ({
+  execute_command: tool({
+    description:
+      "Execute a shell command inside the container (e.g., bun run index.ts, ls -la, mkdir)",
+    parameters: z.object({
+      command: z.string().describe("The shell command to execute"),
+    }),
+    execute: async ({ command }) => {
+      console.log(`\n[TOOL] Execute: ${command}`);
+      try {
+        const output = await executeCommand(containerId, command);
+        console.log(
+          `[TOOL] Output: ${output.substring(0, 100).replace(/\n/g, " ")}...`,
+        );
+        return output;
+      } catch (error: any) {
+        return `Error: ${error.message}`;
+      }
+    },
+  }),
+  read_file: tool({
+    description: "Read contents of a file",
+    parameters: z.object({
+      path: z.string().describe("Path to the file"),
+    }),
+    execute: async ({ path }) => {
+      console.log(`\n[TOOL] Read: ${path}`);
+      try {
+        return await readFile(containerId, path);
+      } catch (error: any) {
+        return `Error: ${error.message}`;
+      }
+    },
+  }),
+  write_file: tool({
+    description: "Write content to a file (will overwrite)",
+    parameters: z.object({
+      path: z.string().describe("Path to the file"),
+      content: z.string().describe("Full file content"),
+    }),
+    execute: async ({ path, content }) => {
+      console.log(`\n[TOOL] Write: ${path} (${content.length} chars)`);
+      try {
+        await writeFile(containerId, path, content);
+        return `Successfully wrote to ${path}`;
+      } catch (error: any) {
+        return `Error: ${error.message}`;
+      }
+    },
+  }),
+  list_directory: tool({
+    description: "List contents of a directory",
+    parameters: z.object({
+      path: z.string().describe("Directory path"),
+    }),
+    execute: async ({ path }) => {
+      console.log(`\n[TOOL] List: ${path}`);
+      try {
+        return await listDirectory(containerId, path);
+      } catch (error: any) {
+        return `Error: ${error.message}`;
+      }
+    },
+  }),
+});
+
+async function runAgent(sessionId: string, containerId: string, task: string) {
+  // 1. Initialize System Message
+  const sysMsg = `You are an expert Coding Agent.
+  ENVIRONMENT:
+  - You are inside a Docker container running Alpine Linux.
+  - 'bun' is installed and available.
+  - You can write files and execute commands.
+  
+  RULES:
+  1. IMPLEMENTATION: Write actual code to files. Do not just output markdown.
+  2. VERIFICATION: After writing code, run it to verify it works.
+  3. PERSISTENCE: If you need a database, use SQLite ('bun:sqlite').
+  4. STEP-BY-STEP: Create files one by one, then verify.
+  
+  Your goal is to complete the user's request fully.`;
+
+  await db.insert(messages).values({
+    id: `msg_sys_${Date.now()}`,
+    sessionId,
+    role: "system",
+    content: JSON.stringify(sysMsg),
+    tokenCount: estimateTokens(sysMsg),
+    createdAt: new Date(),
+  });
+
+  // 2. Add User Task
+  await db.insert(messages).values({
+    id: `msg_user_${Date.now()}`,
+    sessionId,
+    role: "user",
+    content: JSON.stringify(task),
+    tokenCount: estimateTokens(task),
+    createdAt: new Date(),
+  });
+
+  let loopActive = true;
+  let iteration = 0;
+  const MAX_ITERATIONS = 50;
+
+  while (loopActive && iteration < MAX_ITERATIONS) {
+    iteration++;
+    console.log(`\n--- Iteration ${iteration} ---`);
+
+    // A. Fetch Active History
+    const activeMessages = await db
+      .select()
+      .from(messages)
+      .where(
+        and(eq(messages.sessionId, sessionId), eq(messages.compacted, false)),
+      )
+      .orderBy(asc(messages.createdAt));
+
+    // B. Check Token Usage & Compact if needed
+    const totalTokens = activeMessages.reduce(
+      (sum, m) => sum + m.tokenCount,
+      0,
+    );
+    console.log(
+      `Token Usage: ${totalTokens} / ${CONTEXT_LIMIT} (${Math.round((totalTokens / CONTEXT_LIMIT) * 100)}%)`,
+    );
+
+    if (totalTokens > CONTEXT_LIMIT * COMPACTION_THRESHOLD) {
+      await performCompaction(sessionId, activeMessages);
+      // Re-fetch after compaction
+      const refreshedMessages = await db
+        .select()
+        .from(messages)
+        .where(
+          and(eq(messages.sessionId, sessionId), eq(messages.compacted, false)),
+        )
+        .orderBy(asc(messages.createdAt));
+      // Update our local reference
+      activeMessages.length = 0;
+      activeMessages.push(...refreshedMessages);
+    }
+
+    // C. Prepare Messages for LLM
+    // 1. Get latest summary
+    const summary = await getPreviousSummary(sessionId);
+
+    // 2. Convert DB format to Vercel AI SDK CoreMessage format
+    const history: CoreMessage[] = activeMessages.map((m) => {
+      return {
+        role: m.role as any,
+        content: JSON.parse(m.content),
+      };
+    });
+
+    // 3. Inject Summary into System Message
+    // Find the system message (usually first)
+    if (history.length > 0 && history[0].role === "system") {
+      let content = history[0].content as string;
+      if (summary) {
+        content += `\n\n### CONTEXT SUMMARY ###\n${summary}\n\n(Old messages have been compacted. Use this summary as your memory.)`;
+      }
+      history[0].content = content;
+    }
+
+    // D. Call LLM
+    // We use maxSteps: 1 to ensure we return to this loop after every turn
+    // so we can check compaction logic again.
+    const result = await generateText({
+      model: openai("gpt-4-turbo"),
+      messages: history,
+      tools: createTools(containerId),
+      maxSteps: 1,
+    });
+
+    // E. Save New Messages to DB
+    // result.response.messages contains the new messages generated in this turn
+    // (Assistant calls + Tool results if any)
+    const newMessages = result.response.messages;
+
+    for (const msg of newMessages) {
+      // Clean content for storage
+      // The SDK might give us mixed content arrays or strings.
+      // We stringify everything for DB storage.
+      const contentToStore = JSON.stringify(msg.content);
+
+      await db.insert(messages).values({
+        id: `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        sessionId,
+        role: msg.role,
+        content: contentToStore,
+        tokenCount: estimateTokens(contentToStore),
+        createdAt: new Date(),
+        compacted: false,
+      });
+    }
+
+    // F. Check for Completion
+    // If the assistant responded with pure text (no tool calls), it might be asking a question or declaring victory.
+    // In a coding agent, usually, if it doesn't call a tool, it's either done or stuck.
+    const lastMsg = newMessages[newMessages.length - 1];
+
+    // Check if the last message is text-only from assistant
+    let isTextOnly = false;
+    if (lastMsg.role === "assistant") {
+      if (typeof lastMsg.content === "string") isTextOnly = true;
+      else if (Array.isArray(lastMsg.content)) {
+        // Check if there are no tool calls
+        const hasToolCall = lastMsg.content.some(
+          (c: any) => c.type === "tool-call",
+        );
+        isTextOnly = !hasToolCall;
+      }
+    }
+
+    if (isTextOnly) {
+      console.log(
+        "\nAgent did not trigger any tools. Assuming wait state or completion.",
+      );
+      // We can also check if the text contains "DONE" or similar if we prompted it to do so.
+      // For now, we'll stop if it stops using tools to prevent infinite chat loops.
+      // BUT, to be safe, we print the message and break.
+      let textContent = "";
+      if (typeof lastMsg.content === "string") textContent = lastMsg.content;
+      else if (Array.isArray(lastMsg.content))
+        textContent = lastMsg.content.map((c: any) => c.text || "").join("");
+
+      console.log("Response:", textContent);
+      loopActive = false;
+    }
+  }
+
+  if (iteration >= MAX_ITERATIONS) {
+    console.log("⚠️ Max iterations reached. Stopping.");
+  }
+}
+
+// ============================================================================
+// 8. MAIN ENTRY POINT
 // ============================================================================
 
 async function main() {
+  console.log("🚀 Starting Context-Compacting Coding Agent");
+
   try {
-    // Create a new session
-    const sessionId = `session_${Date.now()}`;
-    console.log(`Creating session: ${sessionId}`);
-    
-    // Create Docker container
-    console.log('Creating Docker container...');
+    // 1. Setup Session
+    const sessionId = `sess_${Date.now()}`;
     const containerId = await createContainer();
-    console.log(`Container created: ${containerId}`);
-    
-    // Save session
+
     await db.insert(sessions).values({
       id: sessionId,
       createdAt: new Date(),
       containerId,
     });
-    
-    // Add system message
-    const systemMessageId = `msg_system_${Date.now()}`;
-    await db.insert(messages).values({
-      id: systemMessageId,
-      sessionId,
-      role: 'system',
-      content: `You are a coding agent that MUST use tools to write actual working code. You have access to a Docker container where you can execute commands and create files.
 
-CRITICAL RULES:
-1. You MUST create actual files using write_file tool - never just describe code
-2. You MUST execute commands to test your code
-3. You MUST build working applications, not just explain how to build them
-4. Always use the tools available to you: execute_command, write_file, read_file, list_directory
-5. Work step by step, creating files one at a time
-6. Test your code after creating it
+    console.log(`\n📋 Session: ${sessionId}`);
+    console.log(`📦 Container: ${containerId}`);
 
-Available tools:
-- write_file: Create code files in the container
-- execute_command: Run shell commands and test code
-- read_file: Read files you created
-- list_directory: See what files exist
+    // 2. Define the complex test task
+    const complexTask = `
+      Build a CLI Flashcard App (Anki clone) in this container.
+      
+      REQUIREMENTS:
+      1. Stack: TypeScript, Bun, SQLite.
+      2. Database: Create a 'cards.db' with a 'cards' table (id, front, back, next_review_time).
+      3. Logic: Implement a simple SM-2 spaced repetition algorithm function.
+      4. AI: Create a function 'generateCards(topic)' that simulates calling an AI (just mock it for now to return 3 fixed cards about the topic).
+      5. Interface: Create an 'index.ts' that lets a user add a card or review due cards via CLI args.
+      
+      EXECUTION:
+      - Initialize the project (package.json).
+      - Install dependencies (drizzle-orm, bun-sqlite, etc).
+      - Write the code files.
+      - Run the app to prove it works by adding a card and listing it.
+    `;
 
-Your goal is to BUILD and DELIVER working code, not just describe it.`,
-      tokenCount: estimateTokens('You are a coding agent that MUST use tools to write actual working code...'),
-      createdAt: new Date(),
-      compacted: false,
-    });
-    
-    // Test task from requirements
-    const testTask = `BUILD a working flashcard app like Anki with AI integration in the Docker container. 
+    // 3. Run Agent
+    await runAgent(sessionId, containerId, complexTask);
 
-Requirements:
-1. Create actual TypeScript files with working code
-2. Store flashcards with front/back content in SQLite database
-3. Implement spaced repetition using SM-2 algorithm
-4. Include an AI feature that generates flashcards from a topic
-5. Use TypeScript with Bun runtime
-
-You MUST:
-- Use write_file to create all necessary .ts files
-- Set up the SQLite database
-- Write complete, working code
-- Test it with execute_command
-- Create a working application, not just a code example
-
-Start by creating the project structure and files one by one.`;
-    
-    console.log('\n=== Starting Agent ===\n');
-    const response = await runAgent(sessionId, containerId, testTask);
-    console.log('\n=== Agent Response ===\n');
-    console.log(response);
-    
-    // Cleanup
-    console.log('\nCleaning up...');
+    // 4. Cleanup
+    console.log("\n🧹 Cleaning up container...");
     await cleanupContainer(containerId);
-    console.log('Done!');
-    
+    console.log("✨ Done.");
   } catch (error) {
-    console.error('Error:', error);
+    console.error("FATAL ERROR:", error);
     process.exit(1);
   }
 }
 
-// Run the agent
+// Start
 main();
