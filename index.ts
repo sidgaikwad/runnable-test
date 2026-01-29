@@ -13,10 +13,10 @@ import * as path from "path";
 // 1. CONFIGURATION
 // ============================================================================
 
-const CONTEXT_LIMIT = 5000; // Keep low to force compaction testing
-const COMPACTION_THRESHOLD = 0.8; // Compact at 80%
-const KEEP_RECENT_MESSAGES = 6; // Keep context flow
-const OUTPUT_DIR = "./output"; // Where to save your generated app
+const CONTEXT_LIMIT = 5000;
+const COMPACTION_THRESHOLD = 0.7; // Compact earlier to avoid hitting limit
+const KEEP_RECENT_MESSAGES = 6;
+const OUTPUT_DIR = "./output";
 
 // ============================================================================
 // 2. DATABASE SCHEMA
@@ -34,7 +34,7 @@ const messages = sqliteTable("messages", {
     .notNull()
     .references(() => sessions.id),
   role: text("role").notNull(),
-  content: text("content").notNull(), // Stores JSON string of content
+  content: text("content").notNull(),
   tokenCount: integer("token_count").notNull(),
   createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
   compacted: integer("compacted", { mode: "boolean" }).notNull().default(false),
@@ -47,6 +47,18 @@ const compactionEvents = sqliteTable("compaction_events", {
     .references(() => sessions.id),
   summary: text("summary").notNull(),
   compactedMessageIds: text("compacted_message_ids").notNull(),
+  tokenCount: integer("token_count").notNull(),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+});
+
+const apiCalls = sqliteTable("api_calls", {
+  id: text("id").primaryKey(),
+  sessionId: text("session_id")
+    .notNull()
+    .references(() => sessions.id),
+  promptTokens: integer("prompt_tokens").notNull(),
+  completionTokens: integer("completion_tokens").notNull(),
+  totalTokens: integer("total_tokens").notNull(),
   createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
 });
 
@@ -83,6 +95,18 @@ function initDB() {
       session_id TEXT NOT NULL,
       summary TEXT NOT NULL,
       compacted_message_ids TEXT NOT NULL,
+      token_count INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (session_id) REFERENCES sessions(id)
+    );
+  `);
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS api_calls (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      prompt_tokens INTEGER NOT NULL,
+      completion_tokens INTEGER NOT NULL,
+      total_tokens INTEGER NOT NULL,
       created_at INTEGER NOT NULL,
       FOREIGN KEY (session_id) REFERENCES sessions(id)
     );
@@ -130,7 +154,6 @@ async function createContainer(): Promise<string> {
   try {
     const container = await docker.createContainer({
       Image: "oven/bun:1-alpine",
-      // We install sqlite immediately so the agent can use it for verification
       Cmd: ["/bin/sh", "-c", "apk add --no-cache sqlite && tail -f /dev/null"],
       WorkingDir: "/workspace",
       HostConfig: { AutoRemove: true },
@@ -194,15 +217,12 @@ async function writeFile(
   await exec.start({ Detach: false });
 }
 
-// FEATURE: Export the generated app to your local machine
 async function exportWorkspace(containerId: string, sessionId: string) {
   const sessionDir = path.join(OUTPUT_DIR, sessionId);
   if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
 
   console.log(`\n📦 Exporting workspace to ${sessionDir}...`);
 
-  const container = docker.getContainer(containerId);
-  // Get list of files (excluding hidden ones)
   const fileListRaw = await executeCommand(
     containerId,
     "find . -maxdepth 2 -not -path '*/.*'",
@@ -212,7 +232,6 @@ async function exportWorkspace(containerId: string, sessionId: string) {
   for (const file of files) {
     if (file === "." || file === "./node_modules") continue;
     try {
-      // Check if directory
       const isDir =
         (await executeCommand(
           containerId,
@@ -234,12 +253,19 @@ async function exportWorkspace(containerId: string, sessionId: string) {
 }
 
 // ============================================================================
-// 5. HELPER FUNCTIONS
+// 5. TOKEN TRACKING - THE CORRECT WAY
 // ============================================================================
 
-function estimateTokens(content: any): number {
-  const str = typeof content === "string" ? content : JSON.stringify(content);
-  return Math.ceil(str.length / 4);
+async function getCurrentTokenUsage(sessionId: string): Promise<number> {
+  const calls = await db
+    .select()
+    .from(apiCalls)
+    .where(eq(apiCalls.sessionId, sessionId));
+
+  if (calls.length === 0) return 0;
+
+  const lastCall = calls[calls.length - 1];
+  return lastCall.promptTokens;
 }
 
 // ============================================================================
@@ -260,7 +286,10 @@ async function performCompaction(sessionId: string, activeMessages: any[]) {
   const systemMessages = activeMessages.filter((m) => m.role === "system");
   const otherMessages = activeMessages.filter((m) => m.role !== "system");
 
-  if (otherMessages.length <= KEEP_RECENT_MESSAGES) return;
+  if (otherMessages.length <= KEEP_RECENT_MESSAGES) {
+    console.log("⏭️  Not enough messages to compact");
+    return;
+  }
 
   const messagesToCompact = otherMessages.slice(
     0,
@@ -300,16 +329,19 @@ async function performCompaction(sessionId: string, activeMessages: any[]) {
   PREVIOUS SUMMARY: ${prevSummary || "None"}
   RECENT LOG: ${transcript}`;
 
-  const { text: newSummary } = await generateText({
+  const result = await generateText({
     model: openai("gpt-4-turbo"),
     prompt: summaryPrompt,
   });
 
+  const compactionTokens = result.usage?.totalTokens || 0;
+
   await db.insert(compactionEvents).values({
     id: `evt_${Date.now()}`,
     sessionId,
-    summary: newSummary,
+    summary: result.text,
     compactedMessageIds: JSON.stringify(idsToCompact),
+    tokenCount: compactionTokens,
     createdAt: new Date(),
   });
 
@@ -317,7 +349,8 @@ async function performCompaction(sessionId: string, activeMessages: any[]) {
     .update(messages)
     .set({ compacted: true })
     .where(inArray(messages.id, idsToCompact));
-  console.log(`✅ Compaction complete.`);
+
+  console.log(`✅ Compaction complete (used ${compactionTokens} tokens)`);
 }
 
 // ============================================================================
@@ -374,7 +407,6 @@ const createTools = (containerId: string) => ({
       }
     },
   }),
-  // --- NEW TOOL FOR DATABASE VERIFICATION ---
   inspect_database: tool({
     description:
       "Run a SQL query directly against the SQLite database to verify data exists.",
@@ -387,7 +419,6 @@ const createTools = (containerId: string) => ({
     execute: async ({ path, query }) => {
       console.log(`\n[SQL] ${query} (on ${path})`);
       try {
-        // Use sqlite3 CLI which we installed in the container
         return await executeCommand(
           containerId,
           `sqlite3 ${path} "${query}" -header -column`,
@@ -411,21 +442,23 @@ async function runAgent(sessionId: string, containerId: string, task: string) {
   
   Goal: Build the app, then PROVE it works by listing the database rows in your final step.`;
 
+  const initialMsgId = `msg_sys_${Date.now()}`;
   await db.insert(messages).values({
-    id: `msg_sys_${Date.now()}`,
+    id: initialMsgId,
     sessionId,
     role: "system",
     content: JSON.stringify(sysMsg),
-    tokenCount: estimateTokens(sysMsg),
+    tokenCount: 0,
     createdAt: new Date(),
   });
 
+  const userMsgId = `msg_user_${Date.now()}`;
   await db.insert(messages).values({
-    id: `msg_user_${Date.now()}`,
+    id: userMsgId,
     sessionId,
     role: "user",
     content: JSON.stringify(task),
-    tokenCount: estimateTokens(task),
+    tokenCount: 0,
     createdAt: new Date(),
   });
 
@@ -435,7 +468,23 @@ async function runAgent(sessionId: string, containerId: string, task: string) {
   while (loopActive && iteration < 30) {
     iteration++;
 
-    // Compaction Logic
+    const currentUsage = await getCurrentTokenUsage(sessionId);
+    console.log(
+      `\n--- Step ${iteration} | Last prompt tokens: ${currentUsage}/${CONTEXT_LIMIT} ---`,
+    );
+
+    if (currentUsage > CONTEXT_LIMIT * COMPACTION_THRESHOLD) {
+      const activeMessages = await db
+        .select()
+        .from(messages)
+        .where(
+          and(eq(messages.sessionId, sessionId), eq(messages.compacted, false)),
+        )
+        .orderBy(asc(messages.createdAt));
+
+      await performCompaction(sessionId, activeMessages);
+    }
+
     const activeMessages = await db
       .select()
       .from(messages)
@@ -443,38 +492,17 @@ async function runAgent(sessionId: string, containerId: string, task: string) {
         and(eq(messages.sessionId, sessionId), eq(messages.compacted, false)),
       )
       .orderBy(asc(messages.createdAt));
-    const totalTokens = activeMessages.reduce(
-      (sum, m) => sum + m.tokenCount,
-      0,
-    );
-    console.log(
-      `\n--- Step ${iteration} | Tokens: ${totalTokens}/${CONTEXT_LIMIT} ---`,
-    );
 
-    if (totalTokens > CONTEXT_LIMIT * COMPACTION_THRESHOLD) {
-      await performCompaction(sessionId, activeMessages);
-      // Refresh messages
-      const refreshed = await db
-        .select()
-        .from(messages)
-        .where(
-          and(eq(messages.sessionId, sessionId), eq(messages.compacted, false)),
-        )
-        .orderBy(asc(messages.createdAt));
-      activeMessages.length = 0;
-      activeMessages.push(...refreshed);
-    }
-
-    // Prepare Context
     const summary = await getPreviousSummary(sessionId);
     const history: CoreMessage[] = activeMessages.map((m) => ({
       role: m.role as any,
       content: JSON.parse(m.content),
     }));
-    if (history[0].role === "system" && summary)
-      history[0].content += `\n\n### MEMORY SUMMARY ###\n${summary}`;
 
-    // Generate
+    if (history[0].role === "system" && summary) {
+      history[0].content += `\n\n### MEMORY SUMMARY ###\n${summary}`;
+    }
+
     const result = await generateText({
       model: openai("gpt-4-turbo"),
       messages: history,
@@ -482,20 +510,34 @@ async function runAgent(sessionId: string, containerId: string, task: string) {
       maxSteps: 1,
     });
 
-    // Save
+    if (result.usage) {
+      await db.insert(apiCalls).values({
+        id: `call_${Date.now()}`,
+        sessionId,
+        promptTokens: result.usage.promptTokens,
+        completionTokens: result.usage.completionTokens,
+        totalTokens: result.usage.totalTokens,
+        createdAt: new Date(),
+      });
+
+      console.log(
+        `  📊 API: ${result.usage.promptTokens} prompt + ${result.usage.completionTokens} completion = ${result.usage.totalTokens} total`,
+      );
+    }
+
     for (const msg of result.response.messages) {
       const contentStr = JSON.stringify(msg.content);
+
       await db.insert(messages).values({
         id: `msg_${Date.now()}_${Math.random().toString(36).substr(2)}`,
         sessionId,
         role: msg.role,
         content: contentStr,
-        tokenCount: estimateTokens(contentStr),
+        tokenCount: 0,
         createdAt: new Date(),
       });
     }
 
-    // Stop Check
     const lastMsg =
       result.response.messages[result.response.messages.length - 1];
     if (
@@ -513,7 +555,7 @@ async function runAgent(sessionId: string, containerId: string, task: string) {
 // ============================================================================
 
 async function main() {
-  console.log("🚀 Starting TOP-TIER Coding Agent");
+  console.log("🚀 Starting Agent with API-Based Token Tracking");
 
   try {
     const sessionId = `sess_${Date.now()}`;
@@ -526,7 +568,6 @@ async function main() {
     });
     console.log(`📋 Session: ${sessionId}`);
 
-    // STRICTER PROMPT FOR VERIFICATION
     const rigorousTask = `
       Build a CLI Flashcard App (Anki clone) using TypeScript, Bun, and SQLite.
       
@@ -544,7 +585,6 @@ async function main() {
 
     await runAgent(sessionId, containerId, rigorousTask);
 
-    // EXPORT ARTIFACTS
     await exportWorkspace(containerId, sessionId);
 
     console.log("\n🧹 Cleaning up container...");
