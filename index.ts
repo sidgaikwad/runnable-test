@@ -81,7 +81,54 @@ console.log('✅ Database schema initialized');
 // DOCKER FUNCTIONS
 // ============================================================================
 
-const docker = new Docker({ socketPath: '/var/run/docker.sock' });
+console.log('Initializing Docker connection...');
+console.log('Platform:', process.platform);
+
+// Try multiple Docker connection methods
+let docker: Docker;
+const isWindows = process.platform === 'win32';
+
+async function initializeDocker(): Promise<Docker> {
+  const connectionAttempts: { name: string; config: Docker.DockerOptions }[] = [
+    { name: 'host.docker.internal:2375', config: { host: 'host.docker.internal', port: 2375 } },
+    { name: 'localhost:2375', config: { host: 'localhost', port: 2375 } },
+    { name: '127.0.0.1:2375', config: { host: '127.0.0.1', port: 2375 } },
+  ];
+
+  if (!isWindows) {
+    connectionAttempts.unshift({ 
+      name: 'Unix socket', 
+      config: { socketPath: '/var/run/docker.sock' } 
+    });
+  }
+
+  for (const attempt of connectionAttempts) {
+    try {
+      console.log(`Trying Docker connection: ${attempt.name}...`);
+      const dockerClient = new Docker(attempt.config);
+      await dockerClient.ping();
+      console.log(`✅ Docker connected via ${attempt.name}`);
+      return dockerClient;
+    } catch (error: any) {
+      console.log(`❌ Failed to connect via ${attempt.name}: ${error.message || error.code}`);
+    }
+  }
+
+  // If all attempts failed, show helpful error
+  console.error('\n❌ DOCKER CONNECTION FAILED - All attempts exhausted\n');
+  console.error('Please check:');
+  console.error('1. Docker Desktop is RUNNING');
+  console.error('2. Docker Desktop → Settings → General');
+  console.error('3. Enable: "Expose daemon on tcp://localhost:2375 without TLS"');
+  console.error('4. Click "Apply & Restart"');
+  console.error('5. Wait for Docker to fully restart\n');
+  console.error('Verify with: curl http://localhost:2375/_ping');
+  console.error('Should return: OK\n');
+  
+  process.exit(1);
+}
+
+docker = await initializeDocker();
 
 async function createContainer(): Promise<string> {
   const container = await docker.createContainer({
@@ -528,7 +575,7 @@ async function runAgent(sessionId: string, containerId: string, userQuery: strin
         },
       },
     },
-    maxSteps: 10,
+    maxSteps: 20,
     onStepFinish: async ({ text }) => {
       // Save assistant message after each step
       if (text) {
@@ -580,18 +627,46 @@ async function main() {
       id: systemMessageId,
       sessionId,
       role: 'system',
-      content: 'You are a helpful coding agent that can execute shell commands, read and write files, and help with coding tasks. You work inside a Docker container for safety.',
-      tokenCount: estimateTokens('You are a helpful coding agent that can execute shell commands, read and write files, and help with coding tasks. You work inside a Docker container for safety.'),
+      content: `You are a coding agent that MUST use tools to write actual working code. You have access to a Docker container where you can execute commands and create files.
+
+CRITICAL RULES:
+1. You MUST create actual files using write_file tool - never just describe code
+2. You MUST execute commands to test your code
+3. You MUST build working applications, not just explain how to build them
+4. Always use the tools available to you: execute_command, write_file, read_file, list_directory
+5. Work step by step, creating files one at a time
+6. Test your code after creating it
+
+Available tools:
+- write_file: Create code files in the container
+- execute_command: Run shell commands and test code
+- read_file: Read files you created
+- list_directory: See what files exist
+
+Your goal is to BUILD and DELIVER working code, not just describe it.`,
+      tokenCount: estimateTokens('You are a coding agent that MUST use tools to write actual working code...'),
       createdAt: new Date(),
       compacted: false,
     });
     
     // Test task from requirements
-    const testTask = `Build a flashcard app like Anki with AI integration. It should:
-- Store flashcards with front/back content in SQLite
-- Use spaced repetition (SM-2 algorithm or similar)
-- Include an AI feature that generates flashcards from a topic
-- Be written in TypeScript with Bun`;
+    const testTask = `BUILD a working flashcard app like Anki with AI integration in the Docker container. 
+
+Requirements:
+1. Create actual TypeScript files with working code
+2. Store flashcards with front/back content in SQLite database
+3. Implement spaced repetition using SM-2 algorithm
+4. Include an AI feature that generates flashcards from a topic
+5. Use TypeScript with Bun runtime
+
+You MUST:
+- Use write_file to create all necessary .ts files
+- Set up the SQLite database
+- Write complete, working code
+- Test it with execute_command
+- Create a working application, not just a code example
+
+Start by creating the project structure and files one by one.`;
     
     console.log('\n=== Starting Agent ===\n');
     const response = await runAgent(sessionId, containerId, testTask);
