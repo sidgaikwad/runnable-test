@@ -3,10 +3,9 @@ import { openai } from '@ai-sdk/openai';
 import { drizzle } from 'drizzle-orm/bun-sqlite';
 import { Database } from 'bun:sqlite';
 import { sqliteTable, text, integer } from 'drizzle-orm/sqlite-core';
-import { eq, desc, inArray } from 'drizzle-orm';
+import { eq, desc, inArray, and } from 'drizzle-orm';
 import Docker from 'dockerode';
 import { z } from 'zod';
-
 // ============================================================================
 // DATABASE SCHEMA
 // ============================================================================
@@ -20,7 +19,7 @@ const sessions = sqliteTable('sessions', {
 const messages = sqliteTable('messages', {
   id: text('id').primaryKey(),
   sessionId: text('session_id').notNull().references(() => sessions.id),
-  role: text('role').notNull(), // 'user' | 'assistant' | 'tool'
+  role: text('role').notNull(), // 'user' | 'assistant' | 'system'
   content: text('content').notNull(),
   tokenCount: integer('token_count').notNull(),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
@@ -90,8 +89,8 @@ const isWindows = process.platform === 'win32';
 
 async function initializeDocker(): Promise<Docker> {
   const connectionAttempts: { name: string; config: Docker.DockerOptions }[] = [
-    { name: 'host.docker.internal:2375', config: { host: 'host.docker.internal', port: 2375 } },
     { name: 'localhost:2375', config: { host: 'localhost', port: 2375 } },
+    { name: 'host.docker.internal:2375', config: { host: 'host.docker.internal', port: 2375 } },
     { name: '127.0.0.1:2375', config: { host: '127.0.0.1', port: 2375 } },
   ];
 
@@ -154,33 +153,19 @@ async function executeCommand(containerId: string, command: string): Promise<str
     WorkingDir: '/workspace',
   });
   
-  const stream = await exec.start({ hijack: true, stdin: false });
+  const stream = await exec.start({ Detach: false, Tty: false });
   
   return new Promise((resolve, reject) => {
     let output = '';
-    let errorOutput = '';
     
-    // Docker multiplexes stdout and stderr in a single stream
-    // We need to demux it
-    const stdout = new (require('stream').PassThrough)();
-    const stderr = new (require('stream').PassThrough)();
-    
-    docker.modem.demuxStream(stream, stdout, stderr);
-    
-    stdout.on('data', (chunk: Buffer) => {
-      output += chunk.toString();
-    });
-    
-    stderr.on('data', (chunk: Buffer) => {
-      errorOutput += chunk.toString();
+    stream.on('data', (chunk: Buffer) => {
+      // Remove Docker stream header (8 bytes)
+      const data = chunk.length > 8 ? chunk.slice(8).toString() : chunk.toString();
+      output += data;
     });
     
     stream.on('end', () => {
-      if (errorOutput) {
-        resolve(output + '\nSTDERR: ' + errorOutput);
-      } else {
-        resolve(output);
-      }
+      resolve(output.trim());
     });
     
     stream.on('error', (err: Error) => {
@@ -198,31 +183,18 @@ async function readFile(containerId: string, path: string): Promise<string> {
     AttachStderr: true,
   });
   
-  const stream = await exec.start({ hijack: true, stdin: false });
+  const stream = await exec.start({ Detach: false, Tty: false });
   
   return new Promise((resolve, reject) => {
     let output = '';
-    let errorOutput = '';
     
-    const stdout = new (require('stream').PassThrough)();
-    const stderr = new (require('stream').PassThrough)();
-    
-    docker.modem.demuxStream(stream, stdout, stderr);
-    
-    stdout.on('data', (chunk: Buffer) => {
-      output += chunk.toString();
-    });
-    
-    stderr.on('data', (chunk: Buffer) => {
-      errorOutput += chunk.toString();
+    stream.on('data', (chunk: Buffer) => {
+      const data = chunk.length > 8 ? chunk.slice(8).toString() : chunk.toString();
+      output += data;
     });
     
     stream.on('end', () => {
-      if (errorOutput) {
-        reject(new Error(errorOutput));
-      } else {
-        resolve(output);
-      }
+      resolve(output.trim());
     });
     
     stream.on('error', (err: Error) => {
@@ -234,16 +206,25 @@ async function readFile(containerId: string, path: string): Promise<string> {
 async function writeFile(containerId: string, path: string, content: string): Promise<void> {
   const container = docker.getContainer(containerId);
   
-  // For large content, use base64 encoding
-  const base64Content = Buffer.from(content).toString('base64');
+  // Create directory first
+  const dir = path.substring(0, path.lastIndexOf('/'));
+  if (dir) {
+    const mkdirExec = await container.exec({
+      Cmd: ['/bin/sh', '-c', `mkdir -p ${dir}`],
+      AttachStdout: true,
+      AttachStderr: true,
+    });
+    await mkdirExec.start({ Detach: false, Tty: false });
+  }
   
+  // Write file using cat with heredoc
   const exec = await container.exec({
-    Cmd: ['/bin/sh', '-c', `echo "${base64Content}" | base64 -d > ${path}`],
+    Cmd: ['/bin/sh', '-c', `cat > ${path} << 'EOFMARKER'\n${content}\nEOFMARKER`],
     AttachStdout: true,
     AttachStderr: true,
   });
   
-  await exec.start({ hijack: true, stdin: false });
+  await exec.start({ Detach: false, Tty: false });
 }
 
 async function listDirectory(containerId: string, path: string): Promise<string> {
@@ -255,31 +236,18 @@ async function listDirectory(containerId: string, path: string): Promise<string>
     AttachStderr: true,
   });
   
-  const stream = await exec.start({ hijack: true, stdin: false });
+  const stream = await exec.start({ Detach: false, Tty: false });
   
   return new Promise((resolve, reject) => {
     let output = '';
-    let errorOutput = '';
     
-    const stdout = new (require('stream').PassThrough)();
-    const stderr = new (require('stream').PassThrough)();
-    
-    docker.modem.demuxStream(stream, stdout, stderr);
-    
-    stdout.on('data', (chunk: Buffer) => {
-      output += chunk.toString();
-    });
-    
-    stderr.on('data', (chunk: Buffer) => {
-      errorOutput += chunk.toString();
+    stream.on('data', (chunk: Buffer) => {
+      const data = chunk.length > 8 ? chunk.slice(8).toString() : chunk.toString();
+      output += data;
     });
     
     stream.on('end', () => {
-      if (errorOutput) {
-        resolve(output + '\nERROR: ' + errorOutput);
-      } else {
-        resolve(output);
-      }
+      resolve(output.trim());
     });
     
     stream.on('error', (err: Error) => {
@@ -307,9 +275,9 @@ function estimateTokens(text: string): number {
 // CONTEXT COMPACTION
 // ============================================================================
 
-const CONTEXT_LIMIT = 128000; // tokens
-const COMPACTION_THRESHOLD = 0.8; // 80%
-const KEEP_RECENT_MESSAGES = 15;
+const CONTEXT_LIMIT = 5000; // tokens (lowered for testing - change to 128000 for production)
+const COMPACTION_THRESHOLD = 0.8; // 80% (triggers at 4000 tokens)
+const KEEP_RECENT_MESSAGES = 5; // Keep fewer messages to trigger compaction faster
 
 function calculateTotalTokens(messages: any[]): number {
   return messages.reduce((sum, msg) => sum + (msg.tokenCount || 0), 0);
@@ -330,101 +298,6 @@ async function getPreviousSummary(sessionId: string): Promise<string | null> {
   return events.length > 0 ? events[0].summary : null;
 }
 
-async function generateSummary(
-  messagesToCompact: any[],
-  previousSummary: string | null
-): Promise<string> {
-  const messagesText = messagesToCompact
-    .map(msg => `[${msg.role}]: ${msg.content}`)
-    .join('\n\n');
-  
-  const prompt = `Summarize the following conversation history between a user and a coding agent.
-Focus on:
-1. The main task/goal
-2. Key files created and their purposes
-3. Important decisions or approaches taken
-4. Current progress and state
-5. Any blockers or errors
-
-${previousSummary ? `Previous summary:\n${previousSummary}\n\n` : ''}
-
-Messages to summarize:
-${messagesText}
-
-Provide a concise summary that allows the agent to continue working effectively.`;
-
-  const result = await generateText({
-    model: openai('gpt-4-turbo'),
-    prompt,
-    maxTokens: 1000,
-  });
-  
-  return result.text;
-}
-
-async function compactIfNeeded(sessionId: string, containerId: string): Promise<void> {
-  // Get all messages for this session
-  const allMessages = await db
-    .select()
-    .from(messages)
-    .where(eq(messages.sessionId, sessionId))
-    .orderBy(messages.createdAt);
-  
-  const totalTokens = calculateTotalTokens(allMessages);
-  
-  if (!shouldCompact(totalTokens)) {
-    console.log(`Token count: ${totalTokens}/${CONTEXT_LIMIT} - No compaction needed`);
-    return;
-  }
-  
-  console.log(`Token count: ${totalTokens}/${CONTEXT_LIMIT} - Compacting...`);
-  
-  // Keep the last N messages, compact the rest (skip system message at index 0)
-  const messagesToKeep = allMessages.slice(-KEEP_RECENT_MESSAGES);
-  const messagesToCompact = allMessages.slice(1, -KEEP_RECENT_MESSAGES); // skip system message
-  
-  if (messagesToCompact.length === 0) {
-    console.log('No messages to compact');
-    return;
-  }
-  
-  // Get previous summary
-  const previousSummary = await getPreviousSummary(sessionId);
-  
-  // Generate new summary
-  const summary = await generateSummary(messagesToCompact, previousSummary);
-  
-  // Store compaction event
-  const compactionId = `compaction_${Date.now()}`;
-  await db.insert(compactionEvents).values({
-    id: compactionId,
-    sessionId,
-    summary,
-    compactedMessageIds: JSON.stringify(messagesToCompact.map(m => m.id)),
-    createdAt: new Date(),
-  });
-  
-  // Mark messages as compacted
-  await db
-    .update(messages)
-    .set({ compacted: true })
-    .where(inArray(messages.id, messagesToCompact.map(m => m.id)));
-  
-  // Create a summary message
-  const summaryMessageId = `msg_summary_${Date.now()}`;
-  await db.insert(messages).values({
-    id: summaryMessageId,
-    sessionId,
-    role: 'assistant',
-    content: `[CONTEXT SUMMARY]: ${summary}`,
-    tokenCount: estimateTokens(summary),
-    createdAt: new Date(),
-    compacted: false,
-  });
-  
-  console.log(`✅ Compacted ${messagesToCompact.length} messages into summary`);
-}
-
 // ============================================================================
 // AGENT LOOP
 // ============================================================================
@@ -442,161 +315,269 @@ async function runAgent(sessionId: string, containerId: string, userQuery: strin
     compacted: false,
   });
   
-  // Get all non-compacted messages for context
-  const allMessages = await db
-    .select()
-    .from(messages)
-    .where(eq(messages.sessionId, sessionId))
-    .orderBy(messages.createdAt);
+  let currentStep = 0;
+  let continueLoop = true;
+  let finalResponse = '';
   
-  // Build message history for the model
-  const messageHistory = allMessages.map(msg => ({
-    role: msg.role as 'user' | 'assistant' | 'system',
-    content: msg.content,
-  }));
-  
-  // Run the agent with tools
-  const result = await generateText({
-    model: openai('gpt-4-turbo'),
-    messages: messageHistory,
-    tools: {
-      execute_command: {
-        description: 'Execute a shell command inside the Docker container',
-        parameters: z.object({
-          command: z.string().describe('The shell command to execute'),
-        }),
-        execute: async ({ command }) => {
-          try {
-            const output = await executeCommand(containerId, command);
-            const toolResult = `Command: ${command}\nOutput: ${output}`;
-            
-            // Save tool result
-            const toolMessageId = `msg_tool_${Date.now()}_${Math.random()}`;
-            await db.insert(messages).values({
-              id: toolMessageId,
-              sessionId,
-              role: 'tool',
-              content: toolResult,
-              tokenCount: estimateTokens(toolResult),
-              createdAt: new Date(),
-              compacted: false,
-            });
-            
-            return output;
-          } catch (error: any) {
-            return `Error: ${error.message}`;
-          }
-        },
-      },
-      read_file: {
-        description: 'Read the contents of a file from the Docker container',
-        parameters: z.object({
-          path: z.string().describe('The path to the file to read'),
-        }),
-        execute: async ({ path }) => {
-          try {
-            const content = await readFile(containerId, path);
-            const toolResult = `Read file: ${path}\nContent: ${content}`;
-            
-            // Save tool result
-            const toolMessageId = `msg_tool_${Date.now()}_${Math.random()}`;
-            await db.insert(messages).values({
-              id: toolMessageId,
-              sessionId,
-              role: 'tool',
-              content: toolResult,
-              tokenCount: estimateTokens(toolResult),
-              createdAt: new Date(),
-              compacted: false,
-            });
-            
-            return content;
-          } catch (error: any) {
-            return `Error: ${error.message}`;
-          }
-        },
-      },
-      write_file: {
-        description: 'Write content to a file in the Docker container',
-        parameters: z.object({
-          path: z.string().describe('The path where the file should be written'),
-          content: z.string().describe('The content to write to the file'),
-        }),
-        execute: async ({ path, content }) => {
-          try {
-            await writeFile(containerId, path, content);
-            const result = `File written successfully to ${path}`;
-            const toolResult = `Write file: ${path}\nResult: ${result}`;
-            
-            // Save tool result
-            const toolMessageId = `msg_tool_${Date.now()}_${Math.random()}`;
-            await db.insert(messages).values({
-              id: toolMessageId,
-              sessionId,
-              role: 'tool',
-              content: toolResult,
-              tokenCount: estimateTokens(toolResult),
-              createdAt: new Date(),
-              compacted: false,
-            });
-            
-            return result;
-          } catch (error: any) {
-            return `Error: ${error.message}`;
-          }
-        },
-      },
-      list_directory: {
-        description: 'List the contents of a directory in the Docker container',
-        parameters: z.object({
-          path: z.string().describe('The path to the directory to list'),
-        }),
-        execute: async ({ path }) => {
-          try {
-            const listing = await listDirectory(containerId, path);
-            const toolResult = `List directory: ${path}\nContents: ${listing}`;
-            
-            // Save tool result
-            const toolMessageId = `msg_tool_${Date.now()}_${Math.random()}`;
-            await db.insert(messages).values({
-              id: toolMessageId,
-              sessionId,
-              role: 'tool',
-              content: toolResult,
-              tokenCount: estimateTokens(toolResult),
-              createdAt: new Date(),
-              compacted: false,
-            });
-            
-            return listing;
-          } catch (error: any) {
-            return `Error: ${error.message}`;
-          }
-        },
-      },
-    },
-    maxSteps: 20,
-    onStepFinish: async ({ text }) => {
-      // Save assistant message after each step
-      if (text) {
-        const assistantMessageId = `msg_${Date.now()}_${Math.random()}`;
+  while (continueLoop && currentStep < 20) {
+    // Get all messages from DB
+    const allMessages = await db
+      .select()
+      .from(messages)
+      .where(eq(messages.sessionId, sessionId))
+      .orderBy(messages.createdAt);
+    
+    // Calculate total tokens
+    const totalTokens = calculateTotalTokens(allMessages);
+    console.log(`\nStep ${currentStep + 1}: Token count: ${totalTokens}/${CONTEXT_LIMIT}`);
+    
+    // Check if compaction needed
+    if (totalTokens > (CONTEXT_LIMIT * COMPACTION_THRESHOLD)) {
+      console.log(`🔄 COMPACTING CONTEXT (${totalTokens} tokens exceeds threshold)`);
+      
+      // Get non-compacted messages
+      const nonCompactedMessages = allMessages.filter(m => !m.compacted);
+      
+      // Keep system message and last N messages
+      const systemMessages = nonCompactedMessages.filter(m => m.role === 'system');
+      const otherMessages = nonCompactedMessages.filter(m => m.role !== 'system');
+      const recentMessages = otherMessages.slice(-KEEP_RECENT_MESSAGES);
+      const messagesToCompact = otherMessages.slice(0, -KEEP_RECENT_MESSAGES);
+      
+      if (messagesToCompact.length > 0) {
+        // Get previous summary
+        const previousSummary = await getPreviousSummary(sessionId);
+        
+        // Generate summary
+        const messagesText = messagesToCompact
+          .map(msg => `[${msg.role}]: ${msg.content}`)
+          .join('\n\n');
+        
+        const summaryPrompt = `Summarize the following conversation history between a user and a coding agent.
+Focus on:
+1. The main task/goal
+2. Key files created and their purposes
+3. Important decisions or approaches taken
+4. Current progress and state
+5. Any blockers or errors
+
+${previousSummary ? `Previous summary:\n${previousSummary}\n\n` : ''}
+
+Messages to summarize:
+${messagesText}
+
+Provide a concise summary that allows the agent to continue working effectively.`;
+
+        const summaryResult = await generateText({
+          model: openai('gpt-4-turbo'),
+          prompt: summaryPrompt,
+          maxTokens: 1000,
+        });
+        
+        const summary = summaryResult.text;
+        
+        // Save compaction event
+        const compactionId = `compaction_${Date.now()}`;
+        await db.insert(compactionEvents).values({
+          id: compactionId,
+          sessionId,
+          summary,
+          compactedMessageIds: JSON.stringify(messagesToCompact.map(m => m.id)),
+          createdAt: new Date(),
+        });
+        
+        // Mark old messages as compacted
+        const idsToCompact: string[] = messagesToCompact.map(m => m.id);
+        await db
+          .update(messages)
+          .set({ compacted: true })
+          .where(inArray(messages.id, idsToCompact));
+        
+        // Create summary message
+        const summaryMessageId = `msg_summary_${Date.now()}`;
         await db.insert(messages).values({
-          id: assistantMessageId,
+          id: summaryMessageId,
           sessionId,
           role: 'assistant',
-          content: text,
-          tokenCount: estimateTokens(text),
+          content: `[CONTEXT SUMMARY]: ${summary}`,
+          tokenCount: estimateTokens(summary),
+          createdAt: new Date(),
+          compacted: false,
+        });
+        
+        console.log(`✅ Compacted ${messagesToCompact.length} messages into summary`);
+      }
+    }
+    
+    // Rebuild message history from non-compacted messages
+    const activeMessages = await db
+      .select()
+      .from(messages)
+      .where(and(eq(messages.sessionId, sessionId), eq(messages.compacted, false)))
+      .orderBy(messages.createdAt);
+    
+    const messageHistory = activeMessages.map((msg: any) => ({
+      role: msg.role as 'user' | 'assistant' | 'system',
+      content: msg.content,
+    }));
+    
+    console.log(`Starting agent with ${messageHistory.length} messages in context...`);
+    
+    // Run one step
+    const result = await generateText({
+      model: openai('gpt-4-turbo'),
+      messages: messageHistory,
+      tools: {
+        execute_command: {
+          description: 'Execute a shell command inside the Docker container',
+          parameters: z.object({
+            command: z.string().describe('The shell command to execute'),
+          }),
+          execute: async ({ command }) => {
+            console.log(`[TOOL] Executing command: ${command}`);
+            try {
+              const output = await executeCommand(containerId, command);
+              console.log(`[TOOL] Command output: ${output.substring(0, 200)}...`);
+              return output;
+            } catch (error: any) {
+              console.log(`[TOOL] Command error: ${error.message}`);
+              return `Error: ${error.message}`;
+            }
+          },
+        },
+        read_file: {
+          description: 'Read the contents of a file from the Docker container',
+          parameters: z.object({
+            path: z.string().describe('The path to the file to read'),
+          }),
+          execute: async ({ path }) => {
+            console.log(`[TOOL] Reading file: ${path}`);
+            try {
+              const content = await readFile(containerId, path);
+              console.log(`[TOOL] File read successfully, length: ${content.length}`);
+              return content;
+            } catch (error: any) {
+              console.log(`[TOOL] Read error: ${error.message}`);
+              return `Error: ${error.message}`;
+            }
+          },
+        },
+        write_file: {
+          description: 'Write content to a file in the Docker container',
+          parameters: z.object({
+            path: z.string().describe('The path where the file should be written'),
+            content: z.string().describe('The content to write to the file'),
+          }),
+          execute: async ({ path, content }) => {
+            console.log(`[TOOL] Writing file: ${path} (${content.length} chars)`);
+            try {
+              await writeFile(containerId, path, content);
+              console.log(`[TOOL] File written successfully`);
+              return `File written successfully to ${path}`;
+            } catch (error: any) {
+              console.log(`[TOOL] Write error: ${error.message}`);
+              return `Error: ${error.message}`;
+            }
+          },
+        },
+        list_directory: {
+          description: 'List the contents of a directory in the Docker container',
+          parameters: z.object({
+            path: z.string().describe('The path to the directory to list'),
+          }),
+          execute: async ({ path }) => {
+            console.log(`[TOOL] Listing directory: ${path}`);
+            try {
+              const listing = await listDirectory(containerId, path);
+              console.log(`[TOOL] Directory listed successfully`);
+              return listing;
+            } catch (error: any) {
+              console.log(`[TOOL] List error: ${error.message}`);
+              return `Error: ${error.message}`;
+            }
+          },
+        },
+      },
+      maxSteps: 1, // Only do one step at a time so we can check compaction
+    });
+
+    // Save assistant response and tool results
+    // Process each step - steps contain tool calls and results
+    for (const step of result.steps) {
+      // Save tool calls and results as assistant messages
+      if (step.toolCalls && step.toolCalls.length > 0) {
+        const msgId = `msg_step_${Date.now()}_${Math.random()}`;
+        
+        // Format tool calls and results for storage
+        let content = '';
+        for (let i = 0; i < step.toolCalls.length; i++) {
+          const toolCall = step.toolCalls[i];
+          const toolResult = step.toolResults ? step.toolResults[i] : null;
+          
+          content += `[TOOL CALL: ${toolCall.toolName}]\n`;
+          content += `Args: ${JSON.stringify(toolCall.args)}\n`;
+          if (toolResult) {
+            const resultStr = typeof toolResult.result === 'string' 
+              ? toolResult.result.substring(0, 500) 
+              : JSON.stringify(toolResult.result).substring(0, 500);
+            content += `Result: ${resultStr}\n\n`;
+          }
+        }
+        
+        await db.insert(messages).values({
+          id: msgId,
+          sessionId,
+          role: 'assistant',
+          content: content.trim(),
+          tokenCount: estimateTokens(content),
           createdAt: new Date(),
           compacted: false,
         });
       }
       
-      // Check if compaction is needed after this step
-      await compactIfNeeded(sessionId, containerId);
-    },
-  });
+      // Save text response if present
+      if (step.text) {
+        const msgId = `msg_text_${Date.now()}_${Math.random()}`;
+        await db.insert(messages).values({
+          id: msgId,
+          sessionId,
+          role: 'assistant',
+          content: step.text,
+          tokenCount: estimateTokens(step.text),
+          createdAt: new Date(),
+          compacted: false,
+        });
+        finalResponse = step.text;
+      }
+    }
+    
+    // Also save final text if present
+    if (result.text && !result.steps.some(s => s.text === result.text)) {
+      const msgId = `msg_final_${Date.now()}_${Math.random()}`;
+      await db.insert(messages).values({
+        id: msgId,
+        sessionId,
+        role: 'assistant',
+        content: result.text,
+        tokenCount: estimateTokens(result.text),
+        createdAt: new Date(),
+        compacted: false,
+      });
+      finalResponse = result.text;
+    }
+    
+    // Check if we should continue
+    const lastStep = result.steps[result.steps.length - 1];
+    if (lastStep && lastStep.finishReason === 'stop') {
+      continueLoop = false;
+    }
+    
+    currentStep++;
+  }
+
+  console.log('\n=== Agent completed ===');
   
-  return result.text;
+  return finalResponse;
 }
 
 // ============================================================================
