@@ -1,0 +1,17 @@
+{
+  "name": "context-compacting-agent",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@ai-sdk/openai": "^1.0.0",
+    "ai": "^4.0.0",
+    "dockerode": "^4.0.0",
+    "drizzle-orm": "^0.36.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/dockerode": "^3.3.0",
+    "drizzle-kit": "^0.28.0",
+    "@types/bun": "latest"
+  }
+}
