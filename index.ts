@@ -81,7 +81,7 @@ console.log('✅ Database schema initialized');
 // DOCKER FUNCTIONS
 // ============================================================================
 
-const docker = new Docker();
+const docker = new Docker({ socketPath: '/var/run/docker.sock' });
 
 async function createContainer(): Promise<string> {
   const container = await docker.createContainer({
@@ -111,13 +111,29 @@ async function executeCommand(containerId: string, command: string): Promise<str
   
   return new Promise((resolve, reject) => {
     let output = '';
+    let errorOutput = '';
     
-    stream.on('data', (chunk: Buffer) => {
+    // Docker multiplexes stdout and stderr in a single stream
+    // We need to demux it
+    const stdout = new (require('stream').PassThrough)();
+    const stderr = new (require('stream').PassThrough)();
+    
+    docker.modem.demuxStream(stream, stdout, stderr);
+    
+    stdout.on('data', (chunk: Buffer) => {
       output += chunk.toString();
     });
     
+    stderr.on('data', (chunk: Buffer) => {
+      errorOutput += chunk.toString();
+    });
+    
     stream.on('end', () => {
-      resolve(output);
+      if (errorOutput) {
+        resolve(output + '\nSTDERR: ' + errorOutput);
+      } else {
+        resolve(output);
+      }
     });
     
     stream.on('error', (err: Error) => {
@@ -139,13 +155,27 @@ async function readFile(containerId: string, path: string): Promise<string> {
   
   return new Promise((resolve, reject) => {
     let output = '';
+    let errorOutput = '';
     
-    stream.on('data', (chunk: Buffer) => {
+    const stdout = new (require('stream').PassThrough)();
+    const stderr = new (require('stream').PassThrough)();
+    
+    docker.modem.demuxStream(stream, stdout, stderr);
+    
+    stdout.on('data', (chunk: Buffer) => {
       output += chunk.toString();
     });
     
+    stderr.on('data', (chunk: Buffer) => {
+      errorOutput += chunk.toString();
+    });
+    
     stream.on('end', () => {
-      resolve(output);
+      if (errorOutput) {
+        reject(new Error(errorOutput));
+      } else {
+        resolve(output);
+      }
     });
     
     stream.on('error', (err: Error) => {
@@ -157,11 +187,11 @@ async function readFile(containerId: string, path: string): Promise<string> {
 async function writeFile(containerId: string, path: string, content: string): Promise<void> {
   const container = docker.getContainer(containerId);
   
-  // Escape content for shell
-  const escapedContent = content.replace(/'/g, "'\\''");
+  // For large content, use base64 encoding
+  const base64Content = Buffer.from(content).toString('base64');
   
   const exec = await container.exec({
-    Cmd: ['/bin/sh', '-c', `echo '${escapedContent}' > ${path}`],
+    Cmd: ['/bin/sh', '-c', `echo "${base64Content}" | base64 -d > ${path}`],
     AttachStdout: true,
     AttachStderr: true,
   });
@@ -182,13 +212,27 @@ async function listDirectory(containerId: string, path: string): Promise<string>
   
   return new Promise((resolve, reject) => {
     let output = '';
+    let errorOutput = '';
     
-    stream.on('data', (chunk: Buffer) => {
+    const stdout = new (require('stream').PassThrough)();
+    const stderr = new (require('stream').PassThrough)();
+    
+    docker.modem.demuxStream(stream, stdout, stderr);
+    
+    stdout.on('data', (chunk: Buffer) => {
       output += chunk.toString();
     });
     
+    stderr.on('data', (chunk: Buffer) => {
+      errorOutput += chunk.toString();
+    });
+    
     stream.on('end', () => {
-      resolve(output);
+      if (errorOutput) {
+        resolve(output + '\nERROR: ' + errorOutput);
+      } else {
+        resolve(output);
+      }
     });
     
     stream.on('error', (err: Error) => {
