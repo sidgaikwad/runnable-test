@@ -6,15 +6,17 @@ import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
 import { eq, desc, inArray, and, asc } from "drizzle-orm";
 import Docker from "dockerode";
 import { z } from "zod";
+import * as fs from "fs";
+import * as path from "path";
 
 // ============================================================================
 // 1. CONFIGURATION
 // ============================================================================
 
-// Adjust these based on your model's limits
-const CONTEXT_LIMIT = 5000; // Lower this from 20000
-const COMPACTION_THRESHOLD = 0.8; // Trigger at 80% of limit
-const KEEP_RECENT_MESSAGES = 6; // Keep last 6 messages uncompacted to maintain flow
+const CONTEXT_LIMIT = 5000; // Keep low to force compaction testing
+const COMPACTION_THRESHOLD = 0.8; // Compact at 80%
+const KEEP_RECENT_MESSAGES = 6; // Keep context flow
+const OUTPUT_DIR = "./output"; // Where to save your generated app
 
 // ============================================================================
 // 2. DATABASE SCHEMA
@@ -31,9 +33,8 @@ const messages = sqliteTable("messages", {
   sessionId: text("session_id")
     .notNull()
     .references(() => sessions.id),
-  role: text("role").notNull(), // 'system' | 'user' | 'assistant' | 'tool'
-  // We store content as a JSON string to handle complex ToolCall arrays from Vercel AI SDK
-  content: text("content").notNull(),
+  role: text("role").notNull(),
+  content: text("content").notNull(), // Stores JSON string of content
   tokenCount: integer("token_count").notNull(),
   createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
   compacted: integer("compacted", { mode: "boolean" }).notNull().default(false),
@@ -45,7 +46,7 @@ const compactionEvents = sqliteTable("compaction_events", {
     .notNull()
     .references(() => sessions.id),
   summary: text("summary").notNull(),
-  compactedMessageIds: text("compacted_message_ids").notNull(), // JSON array of IDs
+  compactedMessageIds: text("compacted_message_ids").notNull(),
   createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
 });
 
@@ -64,7 +65,6 @@ function initDB() {
       container_id TEXT
     );
   `);
-
   sqlite.exec(`
     CREATE TABLE IF NOT EXISTS messages (
       id TEXT PRIMARY KEY,
@@ -77,7 +77,6 @@ function initDB() {
       FOREIGN KEY (session_id) REFERENCES sessions(id)
     );
   `);
-
   sqlite.exec(`
     CREATE TABLE IF NOT EXISTS compaction_events (
       id TEXT PRIMARY KEY,
@@ -98,10 +97,9 @@ initDB();
 // ============================================================================
 
 let docker: Docker;
-const isWindows = process.platform === "win32";
 
 async function initializeDocker(): Promise<Docker> {
-  const connectionAttempts: { name: string; config: Docker.DockerOptions }[] = [
+  const connectionAttempts = [
     { name: "localhost:2375", config: { host: "localhost", port: 2375 } },
     {
       name: "host.docker.internal",
@@ -111,41 +109,32 @@ async function initializeDocker(): Promise<Docker> {
   ];
 
   for (const attempt of connectionAttempts) {
-    if (isWindows && attempt.name === "Unix socket") continue;
+    if (process.platform === "win32" && attempt.name === "Unix socket")
+      continue;
     try {
-      console.log(`Checking Docker at ${attempt.name}...`);
       const client = new Docker(attempt.config);
       await client.ping();
       console.log(`✅ Docker connected via ${attempt.name}`);
       return client;
     } catch (e) {
-      // Ignore and try next
+      /* ignore */
     }
   }
-
-  console.error(
-    "❌ Docker connection failed. Ensure Docker Desktop is running.",
-  );
+  console.error("❌ Docker connection failed.");
   process.exit(1);
 }
 
-// We initialize this at the top level for simplicity in this script
 docker = await initializeDocker();
 
 async function createContainer(): Promise<string> {
-  console.log("Creating container (Image: oven/bun:1-alpine)...");
-  // We use the oven/bun image so the agent has 'bun' available immediately
-  // We rely on 'docker pull oven/bun:1-alpine' happening if not present
   try {
     const container = await docker.createContainer({
       Image: "oven/bun:1-alpine",
-      Cmd: ["/bin/sh", "-c", "tail -f /dev/null"], // Keep alive
+      // We install sqlite immediately so the agent can use it for verification
+      Cmd: ["/bin/sh", "-c", "apk add --no-cache sqlite && tail -f /dev/null"],
       WorkingDir: "/workspace",
-      HostConfig: {
-        AutoRemove: true, // Automatically clean up when stopped
-      },
+      HostConfig: { AutoRemove: true },
     });
-
     await container.start();
     return container.id;
   } catch (error: any) {
@@ -154,17 +143,12 @@ async function createContainer(): Promise<string> {
       await new Promise((resolve, reject) => {
         docker.pull("oven/bun:1-alpine", (err: any, stream: any) => {
           if (err) return reject(err);
-          docker.modem.followProgress(stream, onFinished, onProgress);
-          function onFinished(err: any) {
-            if (err) reject(err);
-            else resolve(true);
-          }
-          function onProgress(event: any) {
-            /* silent */
-          }
+          docker.modem.followProgress(stream, (err) =>
+            err ? reject(err) : resolve(true),
+          );
         });
       });
-      return createContainer(); // Retry
+      return createContainer();
     }
     throw error;
   }
@@ -175,34 +159,20 @@ async function executeCommand(
   command: string,
 ): Promise<string> {
   const container = docker.getContainer(containerId);
-
   const exec = await container.exec({
     Cmd: ["/bin/sh", "-c", command],
     AttachStdout: true,
     AttachStderr: true,
     WorkingDir: "/workspace",
   });
-
   const stream = await exec.start({ Detach: false, Tty: false });
-
   return new Promise((resolve, reject) => {
     let output = "";
-    stream.on("data", (chunk: Buffer) => {
-      // Docker streams usually have an 8-byte header we should strip if multiplexed
-      // However, dockerode sometimes handles this depending on options.
-      // For safety with raw streams:
-      const raw = chunk.toString();
-      output += raw;
-    });
-
-    stream.on("end", () => {
-      // Remove non-printable header characters if present (Docker header is usually 8 bytes)
-      // A simple clean is often enough for text output
-      // Note: This is a simplified stream reader.
-      resolve(output.replace(/[\x00-\x09\x0B-\x1F\x7F].{0,7}/g, "").trim());
-    });
-
-    stream.on("error", (err) => reject(err));
+    stream.on("data", (chunk: Buffer) => (output += chunk.toString()));
+    stream.on("end", () =>
+      resolve(output.replace(/[\x00-\x09\x0B-\x1F\x7F].{0,7}/g, "").trim()),
+    );
+    stream.on("error", reject);
   });
 }
 
@@ -212,15 +182,11 @@ async function writeFile(
   content: string,
 ): Promise<void> {
   const container = docker.getContainer(containerId);
-
-  // 1. Ensure directory exists
   const dir = path.substring(0, path.lastIndexOf("/"));
   if (dir) {
     const mkdirExec = await container.exec({ Cmd: ["mkdir", "-p", dir] });
     await mkdirExec.start({ Detach: false });
   }
-
-  // 2. Write file using base64 to avoid shell escaping hell
   const b64Content = Buffer.from(content).toString("base64");
   const exec = await container.exec({
     Cmd: ["/bin/sh", "-c", `echo "${b64Content}" | base64 -d > ${path}`],
@@ -228,39 +194,56 @@ async function writeFile(
   await exec.start({ Detach: false });
 }
 
-async function readFile(containerId: string, path: string): Promise<string> {
-  return await executeCommand(containerId, `cat ${path}`);
-}
+// FEATURE: Export the generated app to your local machine
+async function exportWorkspace(containerId: string, sessionId: string) {
+  const sessionDir = path.join(OUTPUT_DIR, sessionId);
+  if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
 
-async function listDirectory(
-  containerId: string,
-  path: string,
-): Promise<string> {
-  return await executeCommand(containerId, `ls -la ${path}`);
-}
+  console.log(`\n📦 Exporting workspace to ${sessionDir}...`);
 
-async function cleanupContainer(containerId: string): Promise<void> {
-  try {
-    const container = docker.getContainer(containerId);
-    await container.stop();
-    // AutoRemove is set in creation, so it disappears
-  } catch (e) {
-    console.error("Error cleaning up container:", e);
+  const container = docker.getContainer(containerId);
+  // Get list of files (excluding hidden ones)
+  const fileListRaw = await executeCommand(
+    containerId,
+    "find . -maxdepth 2 -not -path '*/.*'",
+  );
+  const files = fileListRaw.split("\n").filter((f) => f && !f.endsWith("."));
+
+  for (const file of files) {
+    if (file === "." || file === "./node_modules") continue;
+    try {
+      // Check if directory
+      const isDir =
+        (await executeCommand(
+          containerId,
+          `[ -d "${file}" ] && echo "yes" || echo "no"`,
+        )) === "yes";
+      if (isDir) continue;
+
+      const content = await executeCommand(containerId, `cat "${file}"`);
+      const localPath = path.join(sessionDir, file);
+      const localDir = path.dirname(localPath);
+
+      if (!fs.existsSync(localDir)) fs.mkdirSync(localDir, { recursive: true });
+      fs.writeFileSync(localPath, content);
+      console.log(`  - Saved ${file}`);
+    } catch (e) {
+      console.log(`  - Failed to save ${file}`);
+    }
   }
 }
 
 // ============================================================================
-// 5. HELPER FUNCTIONS: TOKENS & STORAGE
+// 5. HELPER FUNCTIONS
 // ============================================================================
 
-// Simple heuristic for token counting
 function estimateTokens(content: any): number {
   const str = typeof content === "string" ? content : JSON.stringify(content);
-  return Math.ceil(str.length / 2); // Roughly 2 chars per token
+  return Math.ceil(str.length / 4);
 }
 
 // ============================================================================
-// 6. CONTEXT COMPACTION LOGIC
+// 6. CONTEXT COMPACTION
 // ============================================================================
 
 async function getPreviousSummary(sessionId: string): Promise<string | null> {
@@ -270,23 +253,14 @@ async function getPreviousSummary(sessionId: string): Promise<string | null> {
     .where(eq(compactionEvents.sessionId, sessionId))
     .orderBy(desc(compactionEvents.createdAt))
     .limit(1);
-
   return events.length > 0 ? events[0].summary : null;
 }
 
 async function performCompaction(sessionId: string, activeMessages: any[]) {
-  // We keep:
-  // 1. The System Message (usually index 0)
-  // 2. The last N messages (KEEP_RECENT_MESSAGES)
-  // We compact: Everything in between.
-
   const systemMessages = activeMessages.filter((m) => m.role === "system");
   const otherMessages = activeMessages.filter((m) => m.role !== "system");
 
-  if (otherMessages.length <= KEEP_RECENT_MESSAGES) {
-    console.log("⚠️ Limit reached but not enough messages to compact safely.");
-    return;
-  }
+  if (otherMessages.length <= KEEP_RECENT_MESSAGES) return;
 
   const messagesToCompact = otherMessages.slice(
     0,
@@ -296,25 +270,20 @@ async function performCompaction(sessionId: string, activeMessages: any[]) {
 
   console.log(`🔄 Compacting ${messagesToCompact.length} messages...`);
 
-  // Prepare transcript for summarizer
   const transcript = messagesToCompact
     .map((m) => {
       let contentStr = "";
       try {
         const parsed = JSON.parse(m.content);
-        if (typeof parsed === "string") contentStr = parsed;
-        else if (Array.isArray(parsed)) {
-          // Handle array content (tool calls etc)
-          contentStr = parsed
-            .map((p) => {
-              if (p.type === "text") return p.text;
-              if (p.type === "tool-call") return `[Tool Call: ${p.toolName}]`;
-              if (p.type === "tool-result")
-                return `[Tool Result: ${p.toolName}]`;
-              return JSON.stringify(p);
-            })
-            .join(" ");
-        }
+        contentStr = Array.isArray(parsed)
+          ? parsed
+              .map((p) =>
+                p.type === "tool-call" || p.type === "tool-result"
+                  ? `[${p.toolName}]`
+                  : JSON.stringify(p),
+              )
+              .join(" ")
+          : parsed;
       } catch (e) {
         contentStr = m.content;
       }
@@ -323,30 +292,19 @@ async function performCompaction(sessionId: string, activeMessages: any[]) {
     .join("\n\n");
 
   const prevSummary = await getPreviousSummary(sessionId);
-
-  const summaryPrompt = `
-    You are a technical project manager supervising a coding agent.
-    Summarize the following conversation history concisely.
-    
-    PREVIOUS SUMMARY:
-    ${prevSummary || "None"}
-    
-    RECENT CONVERSATION TO MERGE:
-    ${transcript}
-    
-    INSTRUCTIONS:
-    1. Update the summary to reflect the current state of the project.
-    2. List created files and their purposes.
-    3. Note any outstanding errors or TODOs.
-    4. Discard chatty conversation, focus on technical facts.
-  `;
+  const summaryPrompt = `Summarize this technical session. Focus on:
+  1. What files exist and what they contain.
+  2. What errors were fixed.
+  3. The current state of the database.
+  
+  PREVIOUS SUMMARY: ${prevSummary || "None"}
+  RECENT LOG: ${transcript}`;
 
   const { text: newSummary } = await generateText({
     model: openai("gpt-4-turbo"),
     prompt: summaryPrompt,
   });
 
-  // Save event
   await db.insert(compactionEvents).values({
     id: `evt_${Date.now()}`,
     sessionId,
@@ -355,15 +313,11 @@ async function performCompaction(sessionId: string, activeMessages: any[]) {
     createdAt: new Date(),
   });
 
-  // Mark messages as compacted
   await db
     .update(messages)
     .set({ compacted: true })
     .where(inArray(messages.id, idsToCompact));
-
-  console.log(
-    `✅ Compaction complete. New summary length: ${newSummary.length} chars.`,
-  );
+  console.log(`✅ Compaction complete.`);
 }
 
 // ============================================================================
@@ -372,85 +326,90 @@ async function performCompaction(sessionId: string, activeMessages: any[]) {
 
 const createTools = (containerId: string) => ({
   execute_command: tool({
-    description:
-      "Execute a shell command inside the container (e.g., bun run index.ts, ls -la, mkdir)",
-    parameters: z.object({
-      command: z.string().describe("The shell command to execute"),
-    }),
+    description: "Execute a shell command.",
+    parameters: z.object({ command: z.string() }),
     execute: async ({ command }) => {
-      console.log(`\n[TOOL] Execute: ${command}`);
+      console.log(`\n[CMD] ${command}`);
       try {
-        const output = await executeCommand(containerId, command);
-        console.log(
-          `[TOOL] Output: ${output.substring(0, 100).replace(/\n/g, " ")}...`,
-        );
-        return output;
-      } catch (error: any) {
-        return `Error: ${error.message}`;
+        return await executeCommand(containerId, command);
+      } catch (e: any) {
+        return `Error: ${e.message}`;
       }
     },
   }),
   read_file: tool({
-    description: "Read contents of a file",
-    parameters: z.object({
-      path: z.string().describe("Path to the file"),
-    }),
+    description: "Read file content.",
+    parameters: z.object({ path: z.string() }),
     execute: async ({ path }) => {
-      console.log(`\n[TOOL] Read: ${path}`);
+      console.log(`\n[READ] ${path}`);
       try {
-        return await readFile(containerId, path);
-      } catch (error: any) {
-        return `Error: ${error.message}`;
+        return await executeCommand(containerId, `cat ${path}`);
+      } catch (e: any) {
+        return `Error: ${e.message}`;
       }
     },
   }),
   write_file: tool({
-    description: "Write content to a file (will overwrite)",
-    parameters: z.object({
-      path: z.string().describe("Path to the file"),
-      content: z.string().describe("Full file content"),
-    }),
+    description: "Write content to file.",
+    parameters: z.object({ path: z.string(), content: z.string() }),
     execute: async ({ path, content }) => {
-      console.log(`\n[TOOL] Write: ${path} (${content.length} chars)`);
+      console.log(`\n[WRITE] ${path} (${content.length} chars)`);
       try {
         await writeFile(containerId, path, content);
-        return `Successfully wrote to ${path}`;
-      } catch (error: any) {
-        return `Error: ${error.message}`;
+        return "Success";
+      } catch (e: any) {
+        return `Error: ${e.message}`;
       }
     },
   }),
   list_directory: tool({
-    description: "List contents of a directory",
-    parameters: z.object({
-      path: z.string().describe("Directory path"),
-    }),
+    description: "List directory.",
+    parameters: z.object({ path: z.string() }),
     execute: async ({ path }) => {
-      console.log(`\n[TOOL] List: ${path}`);
+      console.log(`\n[LS] ${path}`);
       try {
-        return await listDirectory(containerId, path);
-      } catch (error: any) {
-        return `Error: ${error.message}`;
+        return await executeCommand(containerId, `ls -la ${path}`);
+      } catch (e: any) {
+        return `Error: ${e.message}`;
+      }
+    },
+  }),
+  // --- NEW TOOL FOR DATABASE VERIFICATION ---
+  inspect_database: tool({
+    description:
+      "Run a SQL query directly against the SQLite database to verify data exists.",
+    parameters: z.object({
+      path: z.string().describe("Path to the .db or .sqlite file"),
+      query: z
+        .string()
+        .describe("The SQL query to run (e.g., SELECT * FROM cards)"),
+    }),
+    execute: async ({ path, query }) => {
+      console.log(`\n[SQL] ${query} (on ${path})`);
+      try {
+        // Use sqlite3 CLI which we installed in the container
+        return await executeCommand(
+          containerId,
+          `sqlite3 ${path} "${query}" -header -column`,
+        );
+      } catch (e: any) {
+        return `SQL Error: ${e.message}`;
       }
     },
   }),
 });
 
 async function runAgent(sessionId: string, containerId: string, task: string) {
-  // 1. Initialize System Message
-  const sysMsg = `You are an expert Coding Agent.
-  ENVIRONMENT:
-  - You are inside a Docker container running Alpine Linux.
-  - 'bun' is installed and available.
-  - You can write files and execute commands.
+  const sysMsg = `You are a Verification-Obsessed Coding Agent.
   
-  RULES:
-  1. IMPLEMENTATION: Write actual code to files. Do not just output markdown.
-  2. VERIFICATION: After writing code, run it to verify it works.
-  3. PERSISTENCE: If you need a database, use SQLite ('bun:sqlite').
-  4. STEP-BY-STEP: Create files one by one, then verify.
+  CORE RULE: "It didn't happen unless you verify it."
   
-  Your goal is to complete the user's request fully.`;
+  1. WHEN CREATING DATA: You MUST use 'inspect_database' to prove the data is in the DB.
+  2. WHEN WRITING CODE: Run it immediately.
+  3. MOCKING AI: For the 'AI generation' part, simply write a function that returns mocked data or calls a free fake API. Do not need a real API key.
+  4. SPACED REPETITION: You must demonstrate the review logic works by running the app in 'review' mode and showing the output.
+  
+  Goal: Build the app, then PROVE it works by listing the database rows in your final step.`;
 
   await db.insert(messages).values({
     id: `msg_sys_${Date.now()}`,
@@ -461,7 +420,6 @@ async function runAgent(sessionId: string, containerId: string, task: string) {
     createdAt: new Date(),
   });
 
-  // 2. Add User Task
   await db.insert(messages).values({
     id: `msg_user_${Date.now()}`,
     sessionId,
@@ -473,13 +431,11 @@ async function runAgent(sessionId: string, containerId: string, task: string) {
 
   let loopActive = true;
   let iteration = 0;
-  const MAX_ITERATIONS = 50;
 
-  while (loopActive && iteration < MAX_ITERATIONS) {
+  while (loopActive && iteration < 30) {
     iteration++;
-    console.log(`\n--- Iteration ${iteration} ---`);
 
-    // A. Fetch Active History
+    // Compaction Logic
     const activeMessages = await db
       .select()
       .from(messages)
@@ -487,56 +443,38 @@ async function runAgent(sessionId: string, containerId: string, task: string) {
         and(eq(messages.sessionId, sessionId), eq(messages.compacted, false)),
       )
       .orderBy(asc(messages.createdAt));
-
-    // B. Check Token Usage & Compact if needed
     const totalTokens = activeMessages.reduce(
       (sum, m) => sum + m.tokenCount,
       0,
     );
     console.log(
-      `Token Usage: ${totalTokens} / ${CONTEXT_LIMIT} (${Math.round((totalTokens / CONTEXT_LIMIT) * 100)}%)`,
+      `\n--- Step ${iteration} | Tokens: ${totalTokens}/${CONTEXT_LIMIT} ---`,
     );
 
     if (totalTokens > CONTEXT_LIMIT * COMPACTION_THRESHOLD) {
       await performCompaction(sessionId, activeMessages);
-      // Re-fetch after compaction
-      const refreshedMessages = await db
+      // Refresh messages
+      const refreshed = await db
         .select()
         .from(messages)
         .where(
           and(eq(messages.sessionId, sessionId), eq(messages.compacted, false)),
         )
         .orderBy(asc(messages.createdAt));
-      // Update our local reference
       activeMessages.length = 0;
-      activeMessages.push(...refreshedMessages);
+      activeMessages.push(...refreshed);
     }
 
-    // C. Prepare Messages for LLM
-    // 1. Get latest summary
+    // Prepare Context
     const summary = await getPreviousSummary(sessionId);
+    const history: CoreMessage[] = activeMessages.map((m) => ({
+      role: m.role as any,
+      content: JSON.parse(m.content),
+    }));
+    if (history[0].role === "system" && summary)
+      history[0].content += `\n\n### MEMORY SUMMARY ###\n${summary}`;
 
-    // 2. Convert DB format to Vercel AI SDK CoreMessage format
-    const history: CoreMessage[] = activeMessages.map((m) => {
-      return {
-        role: m.role as any,
-        content: JSON.parse(m.content),
-      };
-    });
-
-    // 3. Inject Summary into System Message
-    // Find the system message (usually first)
-    if (history.length > 0 && history[0].role === "system") {
-      let content = history[0].content as string;
-      if (summary) {
-        content += `\n\n### CONTEXT SUMMARY ###\n${summary}\n\n(Old messages have been compacted. Use this summary as your memory.)`;
-      }
-      history[0].content = content;
-    }
-
-    // D. Call LLM
-    // We use maxSteps: 1 to ensure we return to this loop after every turn
-    // so we can check compaction logic again.
+    // Generate
     const result = await generateText({
       model: openai("gpt-4-turbo"),
       messages: history,
@@ -544,77 +482,40 @@ async function runAgent(sessionId: string, containerId: string, task: string) {
       maxSteps: 1,
     });
 
-    // E. Save New Messages to DB
-    // result.response.messages contains the new messages generated in this turn
-    // (Assistant calls + Tool results if any)
-    const newMessages = result.response.messages;
-
-    for (const msg of newMessages) {
-      // Clean content for storage
-      // The SDK might give us mixed content arrays or strings.
-      // We stringify everything for DB storage.
-      const contentToStore = JSON.stringify(msg.content);
-
+    // Save
+    for (const msg of result.response.messages) {
+      const contentStr = JSON.stringify(msg.content);
       await db.insert(messages).values({
-        id: `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        id: `msg_${Date.now()}_${Math.random().toString(36).substr(2)}`,
         sessionId,
         role: msg.role,
-        content: contentToStore,
-        tokenCount: estimateTokens(contentToStore),
+        content: contentStr,
+        tokenCount: estimateTokens(contentStr),
         createdAt: new Date(),
-        compacted: false,
       });
     }
 
-    // F. Check for Completion
-    // If the assistant responded with pure text (no tool calls), it might be asking a question or declaring victory.
-    // In a coding agent, usually, if it doesn't call a tool, it's either done or stuck.
-    const lastMsg = newMessages[newMessages.length - 1];
-
-    // Check if the last message is text-only from assistant
-    let isTextOnly = false;
-    if (lastMsg.role === "assistant") {
-      if (typeof lastMsg.content === "string") isTextOnly = true;
-      else if (Array.isArray(lastMsg.content)) {
-        // Check if there are no tool calls
-        const hasToolCall = lastMsg.content.some(
-          (c: any) => c.type === "tool-call",
-        );
-        isTextOnly = !hasToolCall;
-      }
-    }
-
-    if (isTextOnly) {
-      console.log(
-        "\nAgent did not trigger any tools. Assuming wait state or completion.",
-      );
-      // We can also check if the text contains "DONE" or similar if we prompted it to do so.
-      // For now, we'll stop if it stops using tools to prevent infinite chat loops.
-      // BUT, to be safe, we print the message and break.
-      let textContent = "";
-      if (typeof lastMsg.content === "string") textContent = lastMsg.content;
-      else if (Array.isArray(lastMsg.content))
-        textContent = lastMsg.content.map((c: any) => c.text || "").join("");
-
-      console.log("Response:", textContent);
+    // Stop Check
+    const lastMsg =
+      result.response.messages[result.response.messages.length - 1];
+    if (
+      lastMsg.role === "assistant" &&
+      !JSON.stringify(lastMsg.content).includes("tool-call")
+    ) {
+      console.log(`\n🤖 Agent Response: ${lastMsg.content as string}`);
       loopActive = false;
     }
-  }
-
-  if (iteration >= MAX_ITERATIONS) {
-    console.log("⚠️ Max iterations reached. Stopping.");
   }
 }
 
 // ============================================================================
-// 8. MAIN ENTRY POINT
+// 8. MAIN
 // ============================================================================
 
 async function main() {
-  console.log("🚀 Starting Context-Compacting Coding Agent");
+  console.log("🚀 Starting TOP-TIER Coding Agent");
 
   try {
-    // 1. Setup Session
     const sessionId = `sess_${Date.now()}`;
     const containerId = await createContainer();
 
@@ -623,40 +524,39 @@ async function main() {
       createdAt: new Date(),
       containerId,
     });
+    console.log(`📋 Session: ${sessionId}`);
 
-    console.log(`\n📋 Session: ${sessionId}`);
-    console.log(`📦 Container: ${containerId}`);
-
-    // 2. Define the complex test task
-    const complexTask = `
-      Build a CLI Flashcard App (Anki clone) in this container.
+    // STRICTER PROMPT FOR VERIFICATION
+    const rigorousTask = `
+      Build a CLI Flashcard App (Anki clone) using TypeScript, Bun, and SQLite.
       
       REQUIREMENTS:
-      1. Stack: TypeScript, Bun, SQLite.
-      2. Database: Create a 'cards.db' with a 'cards' table (id, front, back, next_review_time).
-      3. Logic: Implement a simple SM-2 spaced repetition algorithm function.
-      4. AI: Create a function 'generateCards(topic)' that simulates calling an AI (just mock it for now to return 3 fixed cards about the topic).
-      5. Interface: Create an 'index.ts' that lets a user add a card or review due cards via CLI args.
+      1. DB: Create 'cards.db'. Table 'cards' (id, front, back, next_review, interval).
+      2. AI: Implement 'generateCards(topic)'. Since we don't have an API key, MOCK this function to return 3 hardcoded cards for the given topic.
+      3. LOGIC: Implement SM-2 algorithm for reviews.
       
-      EXECUTION:
-      - Initialize the project (package.json).
-      - Install dependencies (drizzle-orm, bun-sqlite, etc).
-      - Write the code files.
-      - Run the app to prove it works by adding a card and listing it.
+      VERIFICATION STEPS (YOU MUST DO THIS):
+      1. Run 'bun install' and setup the DB.
+      2. Run the app to add cards for the topic "Chemistry".
+      3. CRITICAL: Use the 'inspect_database' tool to SELECT * FROM cards and prove to me the data is there.
+      4. Run the app in 'review' mode and show the output.
     `;
 
-    // 3. Run Agent
-    await runAgent(sessionId, containerId, complexTask);
+    await runAgent(sessionId, containerId, rigorousTask);
 
-    // 4. Cleanup
+    // EXPORT ARTIFACTS
+    await exportWorkspace(containerId, sessionId);
+
     console.log("\n🧹 Cleaning up container...");
-    await cleanupContainer(containerId);
-    console.log("✨ Done.");
+    await executeCommand(containerId, "rm -rf /workspace");
+    const container = docker.getContainer(containerId);
+    await container.stop();
+
+    console.log(`✨ Done! Your code is saved in ${OUTPUT_DIR}/${sessionId}/`);
   } catch (error) {
     console.error("FATAL ERROR:", error);
     process.exit(1);
   }
 }
 
-// Start
 main();
