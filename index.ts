@@ -9,18 +9,10 @@ import { z } from "zod";
 import * as fs from "fs";
 import * as path from "path";
 
-// ============================================================================
-// 1. CONFIGURATION
-// ============================================================================
-
-const CONTEXT_LIMIT = 2000;
-const COMPACTION_THRESHOLD = 0.7; // Compact earlier to avoid hitting limit
+const CONTEXT_LIMIT = 1500;
+const COMPACTION_THRESHOLD = 0.7;
 const KEEP_RECENT_MESSAGES = 6;
 const OUTPUT_DIR = "./output";
-
-// ============================================================================
-// 2. DATABASE SCHEMA
-// ============================================================================
 
 const sessions = sqliteTable("sessions", {
   id: text("id").primaryKey(),
@@ -62,68 +54,26 @@ const apiCalls = sqliteTable("api_calls", {
   createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
 });
 
-// ============================================================================
-// 3. DATABASE INITIALIZATION
-// ============================================================================
-
 const sqlite = new Database("agent.db");
 const db = drizzle(sqlite);
 
 function initDB() {
-  sqlite.exec(`
-    CREATE TABLE IF NOT EXISTS sessions (
-      id TEXT PRIMARY KEY,
-      created_at INTEGER NOT NULL,
-      container_id TEXT
-    );
-  `);
-  sqlite.exec(`
-    CREATE TABLE IF NOT EXISTS messages (
-      id TEXT PRIMARY KEY,
-      session_id TEXT NOT NULL,
-      role TEXT NOT NULL,
-      content TEXT NOT NULL,
-      token_count INTEGER NOT NULL,
-      created_at INTEGER NOT NULL,
-      compacted INTEGER NOT NULL DEFAULT 0,
-      FOREIGN KEY (session_id) REFERENCES sessions(id)
-    );
-  `);
-  sqlite.exec(`
-    CREATE TABLE IF NOT EXISTS compaction_events (
-      id TEXT PRIMARY KEY,
-      session_id TEXT NOT NULL,
-      summary TEXT NOT NULL,
-      compacted_message_ids TEXT NOT NULL,
-      token_count INTEGER NOT NULL,
-      created_at INTEGER NOT NULL,
-      FOREIGN KEY (session_id) REFERENCES sessions(id)
-    );
-  `);
-  sqlite.exec(`
-    CREATE TABLE IF NOT EXISTS api_calls (
-      id TEXT PRIMARY KEY,
-      session_id TEXT NOT NULL,
-      prompt_tokens INTEGER NOT NULL,
-      completion_tokens INTEGER NOT NULL,
-      total_tokens INTEGER NOT NULL,
-      created_at INTEGER NOT NULL,
-      FOREIGN KEY (session_id) REFERENCES sessions(id)
-    );
-  `);
+  const tables = [
+    "CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, container_id TEXT)",
+    "CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, token_count INTEGER NOT NULL, created_at INTEGER NOT NULL, compacted INTEGER NOT NULL DEFAULT 0, FOREIGN KEY (session_id) REFERENCES sessions(id))",
+    "CREATE TABLE IF NOT EXISTS compaction_events (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, summary TEXT NOT NULL, compacted_message_ids TEXT NOT NULL, token_count INTEGER NOT NULL, created_at INTEGER NOT NULL, FOREIGN KEY (session_id) REFERENCES sessions(id))",
+    "CREATE TABLE IF NOT EXISTS api_calls (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, prompt_tokens INTEGER NOT NULL, completion_tokens INTEGER NOT NULL, total_tokens INTEGER NOT NULL, created_at INTEGER NOT NULL, FOREIGN KEY (session_id) REFERENCES sessions(id))",
+  ];
+  tables.forEach((t) => sqlite.exec(t));
   console.log("✅ Database schema initialized");
 }
 
 initDB();
 
-// ============================================================================
-// 4. DOCKER INFRASTRUCTURE
-// ============================================================================
-
 let docker: Docker;
 
 async function initializeDocker(): Promise<Docker> {
-  const connectionAttempts = [
+  const attempts = [
     { name: "localhost:2375", config: { host: "localhost", port: 2375 } },
     {
       name: "host.docker.internal",
@@ -132,7 +82,7 @@ async function initializeDocker(): Promise<Docker> {
     { name: "Unix socket", config: { socketPath: "/var/run/docker.sock" } },
   ];
 
-  for (const attempt of connectionAttempts) {
+  for (const attempt of attempts) {
     if (process.platform === "win32" && attempt.name === "Unix socket")
       continue;
     try {
@@ -140,9 +90,7 @@ async function initializeDocker(): Promise<Docker> {
       await client.ping();
       console.log(`✅ Docker connected via ${attempt.name}`);
       return client;
-    } catch (e) {
-      /* ignore */
-    }
+    } catch (e) {}
   }
   console.error("❌ Docker connection failed.");
   process.exit(1);
@@ -220,14 +168,13 @@ async function writeFile(
 async function exportWorkspace(containerId: string, sessionId: string) {
   const sessionDir = path.join(OUTPUT_DIR, sessionId);
   if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
-
   console.log(`\n📦 Exporting workspace to ${sessionDir}...`);
 
-  const fileListRaw = await executeCommand(
-    containerId,
-    "find . -maxdepth 2 -not -path '*/.*'",
-  );
-  const files = fileListRaw.split("\n").filter((f) => f && !f.endsWith("."));
+  const files = (
+    await executeCommand(containerId, "find . -maxdepth 2 -not -path '*/.*'")
+  )
+    .split("\n")
+    .filter((f) => f && !f.endsWith("."));
 
   for (const file of files) {
     if (file === "." || file === "./node_modules") continue;
@@ -252,25 +199,14 @@ async function exportWorkspace(containerId: string, sessionId: string) {
   }
 }
 
-// ============================================================================
-// 5. TOKEN TRACKING - THE CORRECT WAY
-// ============================================================================
-
 async function getCurrentTokenUsage(sessionId: string): Promise<number> {
   const calls = await db
     .select()
     .from(apiCalls)
     .where(eq(apiCalls.sessionId, sessionId));
-
   if (calls.length === 0) return 0;
-
-  const lastCall = calls[calls.length - 1];
-  return lastCall.promptTokens;
+  return calls[calls.length - 1].promptTokens;
 }
-
-// ============================================================================
-// 6. CONTEXT COMPACTION (SIMPLIFIED - 23 LINES)
-// ============================================================================
 
 async function getPreviousSummary(sessionId: string): Promise<string | null> {
   const events = await db
@@ -282,13 +218,38 @@ async function getPreviousSummary(sessionId: string): Promise<string | null> {
   return events.length > 0 ? events[0].summary : null;
 }
 
+async function getActiveMessages(sessionId: string) {
+  return await db
+    .select()
+    .from(messages)
+    .where(
+      and(eq(messages.sessionId, sessionId), eq(messages.compacted, false)),
+    )
+    .orderBy(asc(messages.createdAt));
+}
+
+async function insertMessage(
+  sessionId: string,
+  role: string,
+  content: any,
+  tokenCount: number = 0,
+) {
+  await db.insert(messages).values({
+    id: `msg_${Date.now()}_${Math.random().toString(36).substr(2)}`,
+    sessionId,
+    role,
+    content: typeof content === "string" ? content : JSON.stringify(content),
+    tokenCount,
+    createdAt: new Date(),
+  });
+}
+
 async function performCompaction(sessionId: string, activeMessages: any[]) {
   const [sys, ...rest] = activeMessages;
   if (rest.length <= KEEP_RECENT_MESSAGES) return;
 
   const toCompact = rest.slice(0, -KEEP_RECENT_MESSAGES);
   const prevSummary = await getPreviousSummary(sessionId);
-
   const transcript = toCompact
     .map((m) => `${m.role}: ${m.content.substring(0, 200)}`)
     .join("\n");
@@ -317,13 +278,8 @@ async function performCompaction(sessionId: string, activeMessages: any[]) {
         toCompact.map((m) => m.id),
       ),
     );
-
   console.log(`✅ Compacted ${toCompact.length} messages`);
 }
-
-// ============================================================================
-// 7. AGENT LOOP & TOOLS
-// ============================================================================
 
 const createTools = (containerId: string) => ({
   execute_command: tool({
@@ -410,25 +366,8 @@ async function runAgent(sessionId: string, containerId: string, task: string) {
   
   Goal: Build the app, then PROVE it works by listing the database rows in your final step.`;
 
-  const initialMsgId = `msg_sys_${Date.now()}`;
-  await db.insert(messages).values({
-    id: initialMsgId,
-    sessionId,
-    role: "system",
-    content: JSON.stringify(sysMsg),
-    tokenCount: 0,
-    createdAt: new Date(),
-  });
-
-  const userMsgId = `msg_user_${Date.now()}`;
-  await db.insert(messages).values({
-    id: userMsgId,
-    sessionId,
-    role: "user",
-    content: JSON.stringify(task),
-    tokenCount: 0,
-    createdAt: new Date(),
-  });
+  await insertMessage(sessionId, "system", sysMsg, 0);
+  await insertMessage(sessionId, "user", task, 0);
 
   let loopActive = true;
   let iteration = 0;
@@ -442,30 +381,20 @@ async function runAgent(sessionId: string, containerId: string, task: string) {
     );
 
     if (currentUsage > CONTEXT_LIMIT * COMPACTION_THRESHOLD) {
-      const activeMessages = await db
-        .select()
-        .from(messages)
-        .where(
-          and(eq(messages.sessionId, sessionId), eq(messages.compacted, false)),
-        )
-        .orderBy(asc(messages.createdAt));
-
-      await performCompaction(sessionId, activeMessages);
+      await performCompaction(sessionId, await getActiveMessages(sessionId));
     }
 
-    const activeMessages = await db
-      .select()
-      .from(messages)
-      .where(
-        and(eq(messages.sessionId, sessionId), eq(messages.compacted, false)),
-      )
-      .orderBy(asc(messages.createdAt));
-
+    const activeMessages = await getActiveMessages(sessionId);
     const summary = await getPreviousSummary(sessionId);
-    const history: CoreMessage[] = activeMessages.map((m) => ({
-      role: m.role as any,
-      content: JSON.parse(m.content),
-    }));
+    const history: CoreMessage[] = activeMessages.map((m) => {
+      let content;
+      try {
+        content = JSON.parse(m.content);
+      } catch {
+        content = m.content;
+      }
+      return { role: m.role as any, content };
+    });
 
     if (history[0].role === "system" && summary) {
       history[0].content += `\n\n### MEMORY SUMMARY ###\n${summary}`;
@@ -494,16 +423,7 @@ async function runAgent(sessionId: string, containerId: string, task: string) {
     }
 
     for (const msg of result.response.messages) {
-      const contentStr = JSON.stringify(msg.content);
-
-      await db.insert(messages).values({
-        id: `msg_${Date.now()}_${Math.random().toString(36).substr(2)}`,
-        sessionId,
-        role: msg.role,
-        content: contentStr,
-        tokenCount: 0,
-        createdAt: new Date(),
-      });
+      await insertMessage(sessionId, msg.role, msg.content, 0);
     }
 
     const lastMsg =
@@ -517,10 +437,6 @@ async function runAgent(sessionId: string, containerId: string, task: string) {
     }
   }
 }
-
-// ============================================================================
-// 8. MAIN
-// ============================================================================
 
 async function main() {
   console.log("🚀 Starting Agent with API-Based Token Tracking");
@@ -552,7 +468,6 @@ async function main() {
     `;
 
     await runAgent(sessionId, containerId, rigorousTask);
-
     await exportWorkspace(containerId, sessionId);
 
     console.log("\n🧹 Cleaning up container...");
